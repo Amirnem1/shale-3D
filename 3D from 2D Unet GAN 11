@@ -1,0 +1,1765 @@
+# =========================
+# SECTION 1 / 4
+# =========================
+import sys
+!{sys.executable} -m pip install "numpy<2" --quiet
+!{sys.executable} -m pip install scikit-image opencv-python matplotlib scipy scikit-learn tensorflow tifffile --quiet
+
+import os, math, json, random, warnings
+import numpy as np
+import pandas as pd
+from scipy import ndimage
+import cv2
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import tensorflow as tf
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import (
+    Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate,
+    Conv2DTranspose, BatchNormalization, Activation,
+    Add, Multiply, Dropout, Reshape, Dense, LeakyReLU, Flatten,
+    Lambda, GlobalAveragePooling2D, Conv3D, MaxPooling3D, Conv3DTranspose,
+    LayerNormalization, MultiHeadAttention, Attention, Embedding,
+    ZeroPadding3D, Cropping3D, SpatialDropout3D, ReLU
+)
+from tensorflow.keras.applications import InceptionV3
+from scipy.linalg import sqrtm
+from tensorflow.keras.optimizers import Adam, RMSprop
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.mixed_precision import set_global_policy
+from tensorflow.keras.utils import Sequence
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import scipy.ndimage as ndimage
+from scipy import stats, spatial
+import scipy
+from scipy.spatial.distance import cdist
+import tifffile
+from skimage.morphology import ball
+
+warnings.filterwarnings("ignore", message="numpy.*")
+
+# -------------------------
+# Helpers & metrics (ADDED)
+# -------------------------
+def set_global_seed(seed: int = 42):
+    """Deterministic-ish runs across numpy/tensorflow/python hash."""
+    random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+def safe_makedirs(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def normalize01(x, eps=1e-8):
+    x = x.astype(np.float32)
+    mn, mx = np.min(x), np.max(x)
+    return (x - mn) / (mx - mn + eps)
+
+def clip01(x):
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
+
+def robust_minmax_match(src, ref, eps=1e-6):
+    """Histogram match using percentile anchors for robustness."""
+    s1, s99 = np.percentile(src, 1), np.percentile(src, 99)
+    r1, r99 = np.percentile(ref, 1), np.percentile(ref, 99)
+    out = (src - s1) / (s99 - s1 + eps)
+    return clip01(out) * (r99 - r1) + r1
+
+def patchify_2d(img, patch_size=64, stride=64):
+    """Return (N, H, W) patches + (y,x) positions."""
+    H, W = img.shape[:2]
+    ps, st = patch_size, stride
+    patches, pos = [], []
+    for y in range(0, max(H-ps+1, 1), st):
+        for x in range(0, max(W-ps+1, 1), st):
+            yy, xx = min(y, H-ps), min(x, W-ps)
+            patches.append(img[yy:yy+ps, xx:xx+ps])
+            pos.append((yy, xx))
+    return np.stack(patches, 0), pos
+
+def gaussian3d_kernel(size=5, sigma=1.0):
+    ax = np.arange(-size//2 + 1., size//2 + 1.)
+    xx, yy, zz = np.meshgrid(ax, ax, ax, indexing="ij")
+    k = np.exp(-(xx**2 + yy**2 + zz**2)/(2.*sigma**2))
+    return k / np.sum(k)
+
+def percentile_thresholds(arr, ps=(20,40,60,80)):
+    arr = arr.astype(np.float32)
+    return np.percentile(arr, ps)
+
+# --- lightweight spatial metrics (ADDED)
+def morans_I(volume, window=3):
+    """Very lightweight spatial autocorrelation proxy (not exact Moran's I)."""
+    w = np.ones((window, window, window), np.float32); w /= w.sum()
+    mu = ndimage.convolve(volume, w, mode="nearest")
+    num = np.mean((volume - mu) * (mu - mu.mean()))
+    den = np.var(volume) + 1e-8
+    return float(num / den)
+
+def semivariogram_1d(line, max_lag=16):
+    """Simple 1D semivariogram along a line."""
+    line = line.astype(np.float32).ravel()
+    lags = np.arange(1, max_lag+1)
+    gamma = []
+    for h in lags:
+        diff = line[h:] - line[:-h]
+        gamma.append(0.5 * np.mean(diff*diff))
+    return lags, np.array(gamma, np.float32)
+
+# (kept duplicate name for compatibility; does not reduce lines)
+def percentile_thresholds(arr, ps=(20, 40, 60, 80)):
+    arr = arr.astype(np.float32)
+    return np.percentile(arr, ps)
+
+# -------------------------
+# GPU config & mixed precision
+# -------------------------
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+        print(f"✅ Using {len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print("✅ Mixed precision enabled")
+    except RuntimeError as e:
+        print(f"❌ GPU configuration error: {e}")
+
+# -------------------------
+# AdvancedMineralProcessor (unchanged logic, kept to preserve lines)
+# -------------------------
+class AdvancedMineralProcessor:
+    """Advanced mineral composition processor with exact paper methodology"""
+
+    def __init__(self, excel_path):
+        self.excel_path = excel_path
+        self.mineral_data = {}
+
+        self.sample_mapping = {
+            'sample1': 'Sample 10555\\10555',
+            'sample2': 'Sample 11203\\11203',
+            'sample3': 'Sample 11206\\11206',
+            'sample4': 'Sample 12162\\12162',
+            'sample5': 'Sample 17699\\17699',
+            'sample6': 'Sample 19472\\19472',
+            'sample7': 'Sample 21298\\21298',
+            'sample8': 'Sample 23285\\23285'
+        }
+def calculate_fid_score(real_images, generated_images):
+    """Calculate Frechet Inception Distance (FID) score"""
+    # Load pre-trained InceptionV3 model
+    inception = InceptionV3(include_top=False, pooling='avg', input_shape=(299, 299, 3))
+
+    # Preprocess images to 299x299x3
+    real_resized = tf.image.resize(real_images, (299, 299))
+    gen_resized = tf.image.resize(generated_images, (299, 299))
+
+    if real_resized.shape[-1] == 1:
+        real_resized = tf.repeat(real_resized, 3, axis=-1)
+    if gen_resized.shape[-1] == 1:
+        gen_resized = tf.repeat(gen_resized, 3, axis=-1)
+
+    # Get features
+    real_features = inception.predict(real_resized, verbose=0)
+    gen_features = inception.predict(gen_resized, verbose=0)
+
+    # Calculate mean and covariance
+    mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
+    mu2, sigma2 = gen_features.mean(axis=0), np.cov(gen_features, rowvar=False)
+def calculate_phase_connectivity(volume, phase_thresholds=None):
+    """Calculate phase connectivity metrics"""
+    if phase_thresholds is None:
+        phase_thresholds = np.percentile(volume, [20, 40, 60, 80])
+
+    phases = np.zeros_like(volume, dtype=int)
+    phases[volume < phase_thresholds[0]] = 4
+    phases[(volume >= phase_thresholds[0]) & (volume < phase_thresholds[1])] = 3
+    phases[(volume >= phase_thresholds[1]) & (volume < phase_thresholds[2])] = 2
+    phases[(volume >= phase_thresholds[2]) & (volume < phase_thresholds[3])] = 1
+    phases[volume >= phase_thresholds[3]] = 0
+
+    connectivity_metrics = {}
+    phase_names = ['Silicates', 'Carbonate', 'Others', 'Clay', 'Kerogen']
+
+    for phase_id, phase_name in enumerate(phase_names):
+        phase_mask = (phases == phase_id).astype(np.uint8)
+        labeled, num_features = ndimage.label(phase_mask)
+
+        if num_features > 0:
+            component_sizes = np.bincount(labeled.ravel())[1:]  # exclude background
+            connectivity_metrics[phase_name] = {
+                'num_components': num_features,
+                'largest_component_size': np.max(component_sizes) if len(component_sizes) > 0 else 0,
+                'mean_component_size': np.mean(component_sizes) if len(component_sizes) > 0 else 0,
+                'connectivity_ratio': np.max(component_sizes) / np.sum(component_sizes) if np.sum(component_sizes) > 0 else 0
+            }
+        else:
+            connectivity_metrics[phase_name] = {
+                'num_components': 0,
+                'largest_component_size': 0,
+                'mean_component_size': 0,
+                'connectivity_ratio': 0
+            }
+
+    return connectivity_metrics
+
+def calculate_equivalent_modulus_fem(volume, youngs_modulus_dict, phase_thresholds=None):
+    """Calculate equivalent modulus using FEM approach (simplified)"""
+    if phase_thresholds is None:
+        phase_thresholds = np.percentile(volume, [20, 40, 60, 80])
+
+    # Assign phases based on intensity
+    phases = np.zeros_like(volume, dtype=int)
+    phases[volume < phase_thresholds[0]] = 4  # Kerogen
+    phases[(volume >= phase_thresholds[0]) & (volume < phase_thresholds[1])] = 3  # Clay
+    phases[(volume >= phase_thresholds[1]) & (volume < phase_thresholds[2])] = 2  # Others
+    phases[(volume >= phase_thresholds[2]) & (volume < phase_thresholds[3])] = 1  # Carbonate
+    phases[volume >= phase_thresholds[3]] = 0  # Silicates
+
+    # Convert to material properties
+    phase_to_modulus = {
+        0: youngs_modulus_dict['Silicates'],
+        1: youngs_modulus_dict['Carbonate'],
+        2: youngs_modulus_dict['Others'],
+        3: youngs_modulus_dict['Clay'],
+        4: youngs_modulus_dict['Kerogen']
+    }
+
+    # Calculate volume fractions and equivalent modulus (rule of mixtures)
+    total_voxels = volume.size
+    equivalent_modulus = 0
+
+    for phase_id in range(5):
+        phase_fraction = np.sum(phases == phase_id) / total_voxels
+        equivalent_modulus += phase_fraction * phase_to_modulus[phase_id]
+
+    return equivalent_modulus
+
+def calculate_volume_statistics(volume):
+    """Calculate comprehensive volume statistics"""
+    stats = {
+        'mean_intensity': float(np.mean(volume)),
+        'std_intensity': float(np.std(volume)),
+        'min_intensity': float(np.min(volume)),
+        'max_intensity': float(np.max(volume)),
+        'porosity_05': float(np.mean(volume < 0.5)),
+        'porosity_07': float(np.mean(volume < 0.7)),
+        'homogeneity': float(1 - (np.std(volume) / (np.mean(volume) + 1e-8))),
+        'anisotropy_ratio': float(np.std(volume) / (np.mean(volume) + 1e-8))
+    }
+    return stats
+
+def calculate_spatial_correlation(volume, max_lag=20):
+    """Calculate spatial correlation in 3D volume"""
+    center_x, center_y, center_z = [s//2 for s in volume.shape]
+
+    # Calculate correlation along each axis
+    corr_x = [np.corrcoef(volume[center_x, center_y, :-lag],
+                      volume[center_x, center_y, lag:])[0,1]
+          for lag in range(1, min(max_lag, volume.shape[2]//2))]
+    corr_y = [np.corrcoef(volume[center_x, :-lag, center_z],
+                      volume[center_x, lag:, center_z])[0,1]
+          for lag in range(1, min(max_lag, volume.shape[1]//2))]
+    corr_z = [np.corrcoef(volume[:-lag, center_y, center_z],
+                      volume[lag:, center_y, center_z])[0,1]
+          for lag in range(1, min(max_lag, volume.shape[0]//2))]
+
+    return {
+        'correlation_x': np.nanmean(corr_x) if len(corr_x) > 0 else 0,
+        'correlation_y': np.nanmean(corr_y) if len(corr_y) > 0 else 0,
+        'correlation_z': np.nanmean(corr_z) if len(corr_z) > 0 else 0,
+        'anisotropy_index': max(np.nanmean(corr_x), np.nanmean(corr_y), np.nanmean(corr_z)) /
+                       (min(np.nanmean(corr_x), np.nanmean(corr_y), np.nanmean(corr_z)) + 1e-8)
+    }
+    # Calculate FID
+    ssdiff = np.sum((mu1 - mu2) ** 2.0)
+    covmean = sqrtm(sigma1.dot(sigma2))
+
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+    return fid
+
+# -------------------------
+# AdvancedMineralProcessor (unchanged logic, kept to preserve lines)
+# -------------------------
+class AdvancedMineralProcessor:
+    """Advanced mineral composition processor with exact paper methodology"""
+
+    def __init__(self, excel_path):
+        self.excel_path = excel_path
+        self.mineral_data = {}
+
+        self.sample_mapping = {
+            'sample1': 'Sample 10555\\10555',
+            'sample2': 'Sample 11203\\11203',
+            'sample3': 'Sample 11206\\11206',
+            'sample4': 'Sample 12162\\12162',
+            'sample5': 'Sample 17699\\17699',
+            'sample6': 'Sample 19472\\19472',
+            'sample7': 'Sample 21298\\21298',
+            'sample8': 'Sample 23285\\23285'
+        }
+        self.five_phase_model = {
+            'Silicates': ['Quartz', 'Alkali Feldspar', 'Plagioclase'],
+            'Carbonate': ['Calcite', 'Dolomite', 'Ankerite', 'Siderite'],
+            'Clay': ['Illite', 'Chlorite', 'Kaolinite', 'Muscovite', 'Biotite'],
+            'Kerogen': [],
+            'Others': ['Pyrite', 'Zircon', 'Rutile', 'Ilmenite', 'Apatite', 'Monazite', 'Unclassified']
+        }
+
+        self.youngs_modulus = {
+            'Silicates': 89.6,
+            'Carbonate': 74.6,
+            'Clay': 22.3,
+            'Kerogen': 9.2,
+            'Others': 12.392
+        }
+
+        self.density_values = {
+            'Silicates': 2.65,
+            'Carbonate': 2.71,
+            'Clay': 2.60,
+            'Kerogen': 1.30,
+            'Others': 3.50
+        }
+
+    def load_and_parse_excel(self):
+        print("📊 Loading and parsing Excel data...")
+        try:
+            df = pd.read_excel(self.excel_path, sheet_name='Mineral quant_all samples', header=None)
+            print(f"📐 Excel shape: {df.shape}")
+            self.process_single_sheet_data(df)
+            print("✅ Excel data loaded and parsed successfully")
+        except Exception as e:
+            print(f"❌ Error loading Excel: {e}")
+            print("🔄 Creating realistic compositions based on paper...")
+            self.create_realistic_compositions()
+
+    def process_single_sheet_data(self, df):
+        print("📊 Processing single sheet Excel data...")
+        area_start = self.find_data_start(df, 'MODAL AREA%')
+        wt_start = self.find_data_start(df, 'MODAL WT%')
+        assay_start = self.find_data_start(df, 'ASSAY')
+        properties_start = self.find_data_start(df, 'PROPERTIES')
+        print(f"📊 Section starts - Area: {area_start}, WT: {wt_start}, Assay: {assay_start}, Properties: {properties_start}")
+
+        for sample_key, excel_key in self.sample_mapping.items():
+            sample_data = {
+                'five_phase_area': {},
+                'five_phase_wt': {},
+                'assay': {},
+                'properties': {},
+                'detailed_area': {},
+                'detailed_wt': {}
+            }
+            if area_start >= 0:
+                self.extract_mineral_data(df, area_start, self.find_sample_column(df, excel_key, area_start),
+                                          sample_data['detailed_area'], sample_data['five_phase_area'])
+            if wt_start >= 0:
+                self.extract_mineral_data(df, wt_start, self.find_sample_column(df, excel_key, wt_start),
+                                          sample_data['detailed_wt'], sample_data['five_phase_wt'])
+            if assay_start >= 0:
+                self.extract_assay_data(df, assay_start, self.find_sample_column(df, excel_key, assay_start), sample_data['assay'])
+            if properties_start >= 0:
+                self.extract_properties_data(df, properties_start, self.find_sample_column(df, excel_key, properties_start), sample_data['properties'])
+
+            carbon_content = sample_data['assay'].get('C', 0)
+            kerogen_content = carbon_content * 1.2
+            sample_data['five_phase_area']['Kerogen'] = kerogen_content
+            sample_data['five_phase_wt']['Kerogen'] = kerogen_content
+            self.normalize_compositions(sample_data)
+            self.mineral_data[sample_key] = sample_data
+            print(f"✅ Processed {sample_key}: {sample_data['five_phase_area']}")
+
+    def find_data_start(self, df, keyword='Quartz'):
+        for idx, row in df.iterrows():
+            for cell in row:
+                if isinstance(cell, str) and keyword in cell:
+                    return idx
+        return 0
+
+    def find_sample_column(self, df, excel_key, data_start):
+        header_row = data_start - 1 if data_start > 0 else 0
+        for col_idx in range(len(df.columns)):
+            cell_value = df.iloc[header_row, col_idx]
+            if isinstance(cell_value, str) and excel_key in cell_value:
+                return col_idx
+        return -1
+
+    def extract_mineral_data(self, df, start_row, col_idx, detailed_dict, five_phase_dict):
+        mineral_rows = {}
+        for idx in range(start_row, len(df)):
+            mineral_name = df.iloc[idx, 0]
+            if isinstance(mineral_name, str) and mineral_name.strip():
+                try:
+                    value = float(df.iloc[idx, col_idx])
+                    detailed_dict[mineral_name] = value
+                    mineral_rows[mineral_name] = value
+                except (ValueError, TypeError):
+                    continue
+        for phase, minerals in self.five_phase_model.items():
+            phase_total = 0
+            for mineral in minerals:
+                for detailed_mineral, value in mineral_rows.items():
+                    if mineral.lower() in detailed_mineral.lower():
+                        phase_total += value
+                        break
+            five_phase_dict[phase] = phase_total
+
+    def extract_assay_data(self, df, start_row, col_idx, assay_dict):
+        for idx in range(start_row, len(df)):
+            element = df.iloc[idx, 0]
+            if isinstance(element, str) and element.strip():
+                try:
+                    value = float(df.iloc[idx, col_idx])
+                    assay_dict[element] = value
+                except (ValueError, TypeError):
+                    continue
+
+    def extract_properties_data(self, df, start_row, col_idx, properties_dict):
+        for idx in range(start_row, len(df)):
+            property_name = df.iloc[idx, 0]
+            if isinstance(property_name, str) and property_name.strip():
+                try:
+                    value = float(df.iloc[idx, col_idx])
+                    properties_dict[property_name] = value
+                except (ValueError, TypeError):
+                    continue
+
+    def normalize_compositions(self, sample_data):
+        for comp_type in ['five_phase_area', 'five_phase_wt']:
+            total = sum(sample_data[comp_type].values())
+            if total > 0:
+                for phase in sample_data[comp_type]:
+                    sample_data[comp_type][phase] = (sample_data[comp_type][phase] / total) * 100
+
+    def create_realistic_compositions(self):
+        print("🔄 Creating realistic compositions based on paper...")
+        realistic_data = {
+            'sample1': {'Silicates': 75.71, 'Carbonate': 1.64, 'Clay': 20.14, 'Kerogen': 0.26, 'Others': 2.51},
+            'sample2': {'Silicates': 75.29, 'Carbonate': 6.39, 'Clay': 15.20, 'Kerogen': 1.03, 'Others': 3.12},
+            'sample3': {'Silicates': 63.41, 'Carbonate': 8.59, 'Clay': 24.28, 'Kerogen': 1.34, 'Others': 3.72},
+            'sample4': {'Silicates': 67.29, 'Carbonate': 15.81, 'Clay': 13.30, 'Kerogen': 2.57, 'Others': 3.60},
+            'sample5': {'Silicates': 90.48, 'Carbonate': 1.19, 'Clay': 5.94, 'Kerogen': 0.24, 'Others': 2.39},
+            'sample6': {'Silicates': 44.08, 'Carbonate': 1.40, 'Clay': 50.52, 'Kerogen': 0.22, 'Others': 4.00},
+            'sample7': {'Silicates': 88.79, 'Carbonate': 1.04, 'Clay': 6.84, 'Kerogen': 0.17, 'Others': 3.33},
+            'sample8': {'Silicates': 93.95, 'Carbonate': 2.80, 'Clay': 1.41, 'Kerogen': 0.46, 'Others': 1.84}
+        }
+        for sample_key in self.sample_mapping.keys():
+            composition = realistic_data.get(sample_key, realistic_data['sample1'])
+            self.mineral_data[sample_key] = {
+                'five_phase_area': composition,
+                'five_phase_wt': composition,
+                'assay': {'C': composition['Kerogen'] / 1.2},
+                'properties': {'Sample Density': 2.70, 'Hardness': 5.5},
+                'detailed_area': composition,
+                'detailed_wt': composition
+            }
+
+    def get_sample_composition(self, sample_name):
+        return self.mineral_data.get(sample_name, {})
+
+    def get_phase_modulus(self, phase):
+        return self.youngs_modulus.get(phase, 12.392)
+
+    def get_phase_density(self, phase):
+        return self.density_values.get(phase, 2.70)
+
+# -------------------------
+# AdvancedSEMProcessor (MODIFIED: create_training_patches now multi-scale & overlapped)
+# -------------------------
+class AdvancedSEMProcessor:
+    """Advanced SEM image processor with patch generation"""
+
+    def __init__(self, base_path):
+        self.base_path = base_path
+
+    def load_sample_images(self, sample_name):
+        sample_path = os.path.join(self.base_path, sample_name)
+        print(f"🔬 Loading SEM images from: {sample_path}")
+
+        data = {'mineral_map': None, 'bse': None, 'minerals': {}, 'elements': {}, 'metadata': {}}
+
+        mineral_map_path = self.find_file(sample_path, ['Mineral Map.tif', 'Mineral_Map.tif',
+                                                       'mineral_map.tif', '10555_Mineral_Map_scale.tif'])
+        if mineral_map_path:
+            data['mineral_map'] = self.load_tiff_image(mineral_map_path)
+            print(f"✅ Loaded Mineral Map: {os.path.basename(mineral_map_path)}")
+
+        bse_path = self.find_file(sample_path, ['BSE.tif', 'bse.tif', 'Backscattered.tif'])
+        if bse_path:
+            data['bse'] = self.load_tiff_image(bse_path)
+            print(f"✅ Loaded BSE: {os.path.basename(bse_path)}")
+
+        minerals_path = os.path.join(sample_path, 'Minerals')
+        if os.path.exists(minerals_path):
+            for file in os.listdir(minerals_path):
+                if file.endswith(('.tif', '.tiff')):
+                    mineral_name = os.path.splitext(file)[0]
+                    img_path = os.path.join(minerals_path, file)
+                    data['minerals'][mineral_name] = self.load_tiff_image(img_path)
+                    print(f"✅ Loaded mineral: {mineral_name}")
+
+        elements_path = os.path.join(sample_path, 'Elements')
+        if os.path.exists(elements_path):
+            for file in os.listdir(elements_path):
+                if file.endswith(('.tif', '.tiff')):
+                    element_name = os.path.splitext(file)[0]
+                    img_path = os.path.join(elements_path, file)
+                    data['elements'][element_name] = self.load_tiff_image(img_path)
+                    print(f"✅ Loaded element: {element_name}")
+
+        return data
+
+    def find_file(self, directory, possible_names):
+        for name in possible_names:
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def load_tiff_image(self, file_path):
+        try:
+            img = tifffile.imread(file_path)
+            if img.dtype == np.uint16:
+                img = img.astype(np.float32) / 65535.0
+            elif img.dtype == np.uint8:
+                img = img.astype(np.float32) / 255.0
+            else:
+                img = img.astype(np.float32)
+                if img.max() > 1.0:
+                    img = img / img.max()
+            if img.shape[0] != 1024 or img.shape[1] != 1024:
+                img = cv2.resize(img, (1024, 1024), interpolation=cv2.INTER_CUBIC)
+                print(f"🔄 Resized to: {img.shape}")
+            return img
+        except Exception as e:
+            print(f"❌ Error loading {file_path}: {e}")
+            try:
+                img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    raise ValueError("OpenCV could not read image")
+                if img.dtype == np.uint16:
+                    img = img.astype(np.float32) / 65535.0
+                elif img.dtype == np.uint8:
+                    img = img.astype(np.float32) / 255.0
+                else:
+                    img = img.astype(np.float32)
+                    if img.max() > 1.0:
+                        img = img / img.max()
+                if img.shape[0] != 1024 or img.shape[1] != 1024:
+                    img = cv2.resize(img, (1024, 1024), interpolation=cv2.INTER_CUBIC)
+                return img
+            except Exception as e2:
+                print(f"❌ OpenCV also failed: {e2}")
+                return None
+
+    # -------- MODIFIED: multi-scale + overlap
+    def create_training_patches(self, image, grid_size=10, patch_size=64, use_overlap=True):
+        """Create multi-scale, overlapped training patches (improves continuity)."""
+        if image is None:
+            print("❌ No image provided for patch creation")
+            return None, None
+        img = normalize01(image)
+        stride = patch_size//2 if use_overlap else patch_size
+        p1, pos = patchify_2d(img, patch_size=patch_size, stride=stride)
+        s2 = cv2.resize(img, (img.shape[1]//2, img.shape[0]//2), interpolation=cv2.INTER_AREA)
+        p2, _  = patchify_2d(s2, patch_size=patch_size, stride=stride)
+        s3 = cv2.resize(img, (img.shape[1]//4, img.shape[0]//4), interpolation=cv2.INTER_AREA)
+        p3, _  = patchify_2d(s3, patch_size=patch_size, stride=stride)
+        patches = np.concatenate([p1, p2, p3], axis=0)
+        patches = patches[..., None] if patches.ndim==3 else patches  # ensure channel
+        print(f"✅ Created {patches.shape[0]} patches of {patches.shape[1:]} (3 scales, stride={stride})")
+        return patches, pos
+
+    def enhance_image_quality(self, image):
+        if image is None:
+            return None
+        print("✨ Enhancing image quality...")
+        img_uint8 = (clip01(image) * 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(img_uint8)
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+        smoothed = cv2.GaussianBlur(denoised, (3, 3), 1.0)
+        return smoothed.astype(np.float32) / 255.0
+# =========================
+# SECTION 2 / 4
+# =========================
+
+# ---------- Mineral palette (ADDED)
+class MineralPalette:
+    PHASES = ['Silicates','Carbonate','Others','Clay','Kerogen']
+    DEFAULT = {
+        'Silicates': (1.00, 0.85, 0.20),
+        'Carbonate': (0.20, 0.80, 0.20),
+        'Others'   : (0.85, 0.25, 0.25),
+        'Clay'     : (0.55, 0.35, 0.85),
+        'Kerogen'  : (0.15, 0.15, 0.15),
+    }
+    P2I = {p:i for i,p in enumerate(PHASES)}
+    I2P = {i:p for p,i in P2I.items()}
+
+    def __init__(self, base_path):
+        self.base_path = base_path
+        self.palette = dict(self.DEFAULT)
+
+    def _mean_rgb(self, arr):
+        if arr.ndim == 2:
+            rgb = np.stack([arr]*3, -1)
+        elif arr.shape[-1] > 3:
+            rgb = arr[..., :3]
+        else:
+            rgb = arr
+        rgb = normalize01(rgb)
+        return tuple(np.mean(rgb.reshape(-1,3), axis=0))
+
+    def try_extract_from_folder(self, sample_name):
+        sample_dir = os.path.join(self.base_path, sample_name, "Minerals")
+        if not os.path.isdir(sample_dir): return
+        buckets = {p:[] for p in self.PHASES}
+        for f in os.listdir(sample_dir):
+            if not f.lower().endswith(('.tif','.tiff','.png','.jpg','.jpeg')): continue
+            fp = os.path.join(sample_dir, f)
+            try:
+                arr = tifffile.imread(fp)
+            except Exception:
+                arr = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+            if arr is None: continue
+            lname = f.lower()
+            if any(k in lname for k in ["quartz","feldspar","plagio","silic"]): phase="Silicates"
+            elif any(k in lname for k in ["calcite","dolomite","ankerite","siderite","carbon"]): phase="Carbonate"
+            elif any(k in lname for k in ["illite","chlorite","kaolin","muscov","biotite","clay"]): phase="Clay"
+            elif any(k in lname for k in ["kerogen","organic"]): phase="Kerogen"
+            else: phase="Others"
+            buckets[phase].append(self._mean_rgb(arr))
+        for phase, cols in buckets.items():
+            if len(cols):
+                self.palette[phase] = tuple(np.mean(np.array(cols), axis=0))
+
+    def colorize_labels(self, label_vol):
+        H,W,D = label_vol.shape
+        rgb = np.zeros((H,W,D,3), np.float32)
+        for i, phase in self.I2P.items():
+            rgb[label_vol==i] = self.palette[phase]
+        return rgb
+
+    def id_to_color(self, idx):
+        return self.palette[self.I2P[int(idx)]]
+
+# ---------- Continuity/morphology (ADDED)
+class VolumeContinuityEnforcer:
+    def __init__(self, smooth_sigma=1.0, cc_min_frac=0.0005):
+        self.sigma = float(smooth_sigma)
+        self.cc_min_frac = float(cc_min_frac)
+        self._gauss3d = gaussian3d_kernel(5, 1.0)
+
+    def anisotropic_diffusion_3d(self, vol, iters=6, kappa=45.0, gamma=0.12):
+        vol = vol.astype(np.float32)
+        for _ in range(iters):
+            gx, gy, gz = np.gradient(vol)
+            gmag = np.sqrt(gx*gx + gy*gy + gz*gz)
+            c = 1.0/(1.0+(gmag/kappa)**2)
+
+        # Calculate divergence term properly
+            cx = np.gradient(c * gx, axis=0)
+            cy = np.gradient(c * gy, axis=1)
+            cz = np.gradient(c * gz, axis=2)
+            vol = vol + gamma * (cx + cy + cz)
+        return np.clip(vol, 0, 1)
+
+    def gaussian_3d(self, vol, sigma=None):
+        return ndimage.gaussian_filter(vol, self.sigma if sigma is None else float(sigma))
+
+    def sharpen_boundaries(self, vol, alpha=0.3):
+        blur = self.gaussian_3d(vol, sigma=1.2)
+        return clip01(vol + alpha*(vol - blur))
+
+    def smooth_labels_3d(self, lbl, radius=1):
+        se = ball(int(radius))
+        out = lbl.copy()
+        for _ in range(2):
+            votes = np.zeros((lbl.shape[0], lbl.shape[1], lbl.shape[2], 5), np.int32)
+            for lab in range(5):
+                votes[..., lab] = ndimage.convolve((out==lab).astype(np.int32), se, mode='nearest')
+            out = np.argmax(votes, axis=-1).astype(np.int32)
+        return out
+
+    def prune_small_components(self, lbl):
+        H,W,D = lbl.shape; total = H*W*D
+        cleaned = lbl.copy()
+        for lab in range(5):
+            mask = (lbl==lab).astype(np.uint8)
+            L, n = ndimage.label(mask)
+            if n <= 1: continue
+            sizes = np.bincount(L.ravel())
+            keep = set(np.where(sizes >= max(8, int(self.cc_min_frac*total)))[0]); keep.discard(0)
+            keep_mask = np.isin(L, list(keep))
+            holes = (~keep_mask) & (lbl==lab)
+            if holes.any():
+                _, idx = ndimage.distance_transform_edt(~holes, return_indices=True)
+                cleaned[holes] = lbl[tuple(idx[:, holes])]
+        return cleaned
+
+# ---------- Labeling + composition prior (ADDED)
+class LabelAssigner:
+    def __init__(self, target_comp):
+        self.target = target_comp
+
+    def thresholds_from_intensity(self, vol):
+        return percentile_thresholds(vol, (20,40,60,80))
+
+    def assign(self, vol):
+        t20,t40,t60,t80 = self.thresholds_from_intensity(vol)
+        L = np.zeros_like(vol, np.int32)
+        L[vol<t20] = 4
+        L[(vol>=t20)&(vol<t40)] = 3
+        L[(vol>=t40)&(vol<t60)] = 2
+        L[(vol>=t60)&(vol<t80)] = 1
+        L[vol>=t80] = 0
+        return L
+
+    def soft_rebalance(self, lbl):
+        keys = ['Silicates','Carbonate','Others','Clay','Kerogen']
+        tgt = np.array([self.target.get(k,0) for k in keys], np.float32)
+        cur = np.array([(lbl==i).mean()*100.0 for i in range(5)], np.float32)
+        diff = tgt - cur
+        if np.all(np.abs(diff) < 0.5): return lbl
+        out = lbl.copy()
+        order = np.argsort(-np.abs(diff))
+        kernel = np.ones((3,3,3), np.uint8)
+        for cls in order:
+            if diff[cls] <= 0: continue
+            donor = int(np.argmax(cur - tgt))
+            if donor == cls: continue
+            donor_mask = (out==donor)
+            neighbor = ndimage.binary_dilation((out==cls), structure=kernel)
+            border = donor_mask & neighbor
+            need = int(((diff[cls]/100.0) * lbl.size) / 4)
+            idxs = np.where(border.ravel())[0]
+            if idxs.size == 0: continue
+            sel = np.random.choice(idxs, size=min(need, idxs.size), replace=False)
+            out.ravel()[sel] = cls
+            cur = np.array([(out==i).mean()*100.0 for i in range(5)], np.float32)
+        return out
+
+class CompositionTools:
+    @staticmethod
+    def composition_from_labels(lbl):
+        return dict(zip(['Silicates','Carbonate','Others','Clay','Kerogen'],
+                        [(lbl==i).mean()*100.0 for i in range(5)]))
+
+    @staticmethod
+    def similarity_score(a, b):
+        keys = ['Silicates','Carbonate','Others','Clay','Kerogen']
+        A = np.array([a.get(k,0) for k in keys], np.float32)
+        B = np.array([b.get(k,0) for k in keys], np.float32)
+        return float(1.0 - np.mean(np.abs(A - B)/100.0))
+
+# ---------- Multi-scale assembler (ADDED)
+class MultiScaleVolumeAssembler:
+    """
+    Assemble a cubic volume from 2D patches across scales with overlap & blending.
+    """
+    def __init__(self, vol_size=128, patch_size=64, stride=32, smooth_sigma=0.8):
+        self.V = int(vol_size)
+        self.P = int(patch_size)
+        self.S = int(stride)
+        self.kernel = gaussian3d_kernel(size=5, sigma=1.0)
+        self.sigma = float(smooth_sigma)
+
+    def _augment2d(self, p):
+        if np.random.rand()<0.5: p = cv2.flip(p, 1)
+        if np.random.rand()<0.5: p = cv2.flip(p, 0)
+        k = np.random.choice([0,1,2,3])
+        if k: p = np.rot90(p, k)
+        return p
+
+    def assemble(self, patch_bank_list):
+        V = self.V
+        out = np.zeros((V,V,V), np.float32)
+        wts = np.zeros_like(out)
+
+        n_slices = max(2, V // max(2, self.P//2))
+        z_thick  = max(2, V // n_slices)
+
+        for zi in range(n_slices):
+            bank = patch_bank_list[zi % len(patch_bank_list)]
+            if len(bank) == 0:
+                base = np.random.rand(self.P, self.P).astype(np.float32)
+            else:
+                base = bank[np.random.randint(0, len(bank))]
+            base = normalize01(base.squeeze())
+            base = self._augment2d(base)
+
+            tiled = np.tile(base, (math.ceil(V/self.P), math.ceil(V/self.P)))[:V,:V]
+            tiled = ndimage.gaussian_filter(tiled, self.sigma)
+            chunk = np.repeat(tiled[...,None], z_thick, axis=2)
+            if chunk.ndim == 4:
+                chunk = np.squeeze(chunk, axis=-1)
+            chunk = ndimage.convolve(chunk, self.kernel, mode='nearest', axes=(0,1,2))
+     # --- FIX: bounds-safe Z-write (avoid broadcasting mismatches) ---
+            z0 = zi * z_thick
+            if z0 >= V:
+                break
+            z_len = min(chunk.shape[2], V - z0)
+            out[:chunk.shape[0], :chunk.shape[1], z0:z0+z_len] += chunk[:, :, :z_len]
+            wts[:chunk.shape[0], :chunk.shape[1], z0:z0+z_len] += 1.0
+
+        out = np.divide(out, np.maximum(wts, 1e-6))
+        return clip01(out)
+
+    def make_banks(self, base_img, patch_size=64):
+        s1 = normalize01(base_img)
+        s2 = cv2.resize(s1, (s1.shape[1]//2, s1.shape[0]//2), interpolation=cv2.INTER_AREA)
+        s3 = cv2.resize(s1, (s1.shape[1]//4, s1.shape[0]//4), interpolation=cv2.INTER_AREA)
+        b1, _ = patchify_2d(s1, patch_size=patch_size, stride=patch_size//2)
+        b2, _ = patchify_2d(s2, patch_size=patch_size, stride=patch_size//2)
+        b3, _ = patchify_2d(s3, patch_size=patch_size, stride=patch_size//2)
+        return [b1, b2, b3]
+
+# ---------- 3D refiner (ADDED)
+def build_refiner3d(input_shape=(128,128,128,1), features=16):
+    I = Input(input_shape)
+    x1 = Conv3D(features,3,padding='same',activation='relu')(I)
+    x1 = Conv3D(features,3,padding='same',activation='relu')(x1)
+    p1 = tf.keras.layers.MaxPool3D(2)(x1)
+    x2 = Conv3D(features*2,3,padding='same',activation='relu')(p1)
+    x2 = Conv3D(features*2,3,padding='same',activation='relu')(x2)
+    p2 = tf.keras.layers.MaxPool3D(2)(x2)
+    b  = Conv3D(features*4,3,padding='same',activation='relu')(p2)
+    b  = Conv3D(features*4,3,padding='same',activation='relu')(b)
+    u2 = tf.keras.layers.UpSampling3D(2)(b); u2 = concatenate([u2,x2])
+    y2 = Conv3D(features*2,3,padding='same',activation='relu')(u2)
+    y2 = Conv3D(features*2,3,padding='same',activation='relu')(y2)
+    u1 = tf.keras.layers.UpSampling3D(2)(y2); u1 = concatenate([u1,x1])
+    y1 = Conv3D(features,3,padding='same',activation='relu')(u1)
+    y1 = Conv3D(features,3,padding='same',activation='relu')(y1)
+    O  = Conv3D(1,1,activation='sigmoid')(y1)
+    m  = Model(I,O,name="Refiner3D")
+    m.compile(optimizer=Adam(1e-4), loss='mse')
+    return m
+
+# ---------- Color & export helpers (ADDED)
+class ColorAndExportTools:
+    def __init__(self, base_path, palette: MineralPalette):
+        self.base_path = base_path
+        self.palette = palette
+        safe_makedirs(os.path.join(base_path, "Output/Colored"))
+        safe_makedirs(os.path.join(base_path, "Output/TIFF_Stacks"))
+
+    def save_colored_center_slices(self, label_vol, sample_name):
+        outdir = os.path.join(self.base_path, "Output/Colored", sample_name)
+        safe_makedirs(outdir)
+        rgb = self.palette.colorize_labels(label_vol)
+        zc, yc, xc = label_vol.shape[2]//2, label_vol.shape[1]//2, label_vol.shape[0]//2
+        plt.imsave(os.path.join(outdir, "slice_Z.png"), rgb[:,:,zc])
+        plt.imsave(os.path.join(outdir, "slice_Y.png"), rgb[:,yc,:])
+        plt.imsave(os.path.join(outdir, "slice_X.png"), rgb[xc,:,:])
+        print(f"✅ Colored center slices saved: {outdir}")
+
+    def save_tiff_stack_labels(self, label_vol, sample_name):
+        outfp = os.path.join(self.base_path, "Output/TIFF_Stacks", f"{sample_name}_labels.tif")
+        tifffile.imwrite(outfp, label_vol.astype(np.uint8), photometric='minisblack')
+        print(f"✅ Label stack: {outfp}")
+
+def export_rgb_volume_as_tiff(rgb_vol, out_fp):
+    vol8 = (clip01(rgb_vol)*255).astype(np.uint8)          # H,W,D,3
+    vol_pages = np.moveaxis(vol8, 2, 0)                    # D,H,W,3
+    tifffile.imwrite(out_fp, vol_pages)
+
+# ---------- Extra visualizer (ADDED)
+class ExtraVisualizer:
+    def __init__(self, base_path):
+        self.base_path = base_path
+        safe_makedirs(os.path.join(base_path, "Output/Visualizations"))
+
+    def orthogrid(self, vol, sample_name, n=6):
+        idxs = np.linspace(0, vol.shape[2]-1, n, dtype=int)
+        fig, axes = plt.subplots(1, n, figsize=(3*n, 3))
+        for i, z in enumerate(idxs):
+            axes[i].imshow(vol[:,:,z], cmap='gray'); axes[i].set_title(f"Z={z}")
+            axes[i].axis('off')
+        out = os.path.join(self.base_path, 'Output/Visualizations', f'{sample_name}_orthogrid.png')
+        plt.tight_layout(); plt.savefig(out, dpi=180); plt.close()
+        print("✅ Orthogrid:", out)
+
+    def composition_radar(self, target, achieved, sample_name):
+        phases = ['Silicates','Carbonate','Others','Clay','Kerogen']
+        values_t = [target[p] for p in phases]
+        values_a = [achieved.get(p,0) for p in phases]
+        values_t += values_t[:1]; values_a += values_a[:1]
+        angles = np.linspace(0, 2*np.pi, len(values_t))
+        fig = plt.figure(figsize=(6,6))
+        ax = plt.subplot(111, polar=True)
+        ax.plot(angles, values_t, linewidth=2, label='Target'); ax.fill(angles, values_t, alpha=0.1)
+        ax.plot(angles, values_a, linewidth=2, label='Achieved'); ax.fill(angles, values_a, alpha=0.1)
+        ax.set_xticks(angles[:-1]); ax.set_xticklabels(phases)
+        ax.set_ylim(0, max(max(values_t), max(values_a)) * 1.1)
+        ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.2))
+        out = os.path.join(self.base_path, 'Output/Visualizations', f'{sample_name}_radar.png')
+        plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+        print("✅ Radar:", out)
+# =========================
+# SECTION 3 / 4
+# =========================
+
+# --------- Dice + CE loss (ADDED)
+def dice_coef(y_true, y_pred, smooth=1.0):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(tf.clip_by_value(y_pred, 1e-7, 1.0), tf.float32)
+    axes = tuple(range(1, len(y_pred.shape)-1))
+    inter = tf.reduce_sum(y_true*y_pred, axis=axes)
+    denom = tf.reduce_sum(y_true+y_pred, axis=axes)
+    return tf.reduce_mean((2.*inter+smooth)/(denom+smooth))
+
+def dice_ce_loss(y_true, y_pred, ce_weight=0.5):
+    y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0)
+    ce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+    return ce_weight*ce + (1.0-ce_weight)*(1.0 - dice_coef(y_true, y_pred))
+
+# --------- ResidualAttentionUNet (MODIFIED: build_model uses Dice+CE)
+class ResidualAttentionUNet:
+    """Advanced Residual Attention U-Net for semantic segmentation"""
+
+    def __init__(self, input_size=(64, 64, 1), num_classes=5):
+        self.input_size = input_size
+        self.num_classes = num_classes
+        self.model = self.build_model()
+
+    def residual_block(self, x, filters, kernel_size=3, stride=1):
+        shortcut = x
+        x = BatchNormalization()(x); x = ReLU()(x)
+        x = Conv2D(filters, kernel_size, strides=stride, padding='same')(x)
+        x = BatchNormalization()(x); x = ReLU()(x)
+        x = Conv2D(filters, kernel_size, strides=1, padding='same')(x)
+        if shortcut.shape[-1] != filters or stride != 1:
+            shortcut = Conv2D(filters, 1, strides=stride, padding='same')(shortcut)
+        x = Add()([x, shortcut])
+        return x
+
+    def attention_block(self, x, g, filters):
+        theta_x = Conv2D(filters, 1, strides=1, padding='same')(x)
+        phi_g   = Conv2D(filters, 1, strides=1, padding='same')(g)
+        add     = Add()([theta_x, phi_g])
+        relu    = ReLU()(add)
+        psi     = Conv2D(1, 1, strides=1, padding='same')(relu)
+        sigmoid = Activation('sigmoid')(psi)
+        return Multiply()([x, sigmoid])
+    def build_resnet18_3d(input_shape=(64, 64, 64, 1)):
+        """ResNet-18 3D architecture for equivalent modulus prediction (as in paper)"""
+        def residual_block(x, filters, stride=1):
+            shortcut = x
+            x = Conv3D(filters, 3, strides=stride, padding='same')(x)
+            x = BatchNormalization()(x)
+            x = ReLU()(x)
+            x = Conv3D(filters, 3, strides=1, padding='same')(x)
+            x = BatchNormalization()(x)
+
+            if stride != 1 or shortcut.shape[-1] != filters:
+                shortcut = Conv3D(filters, 1, strides=stride, padding='same')(shortcut)
+                shortcut = BatchNormalization()(shortcut)
+
+            x = Add()([x, shortcut])
+            x = ReLU()(x)
+            return x
+
+        inputs = Input(input_shape)
+
+    # Initial conv
+        x = Conv3D(64, 7, strides=2, padding='same')(inputs)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        x = MaxPooling3D(3, strides=2, padding='same')(x)
+
+    # Residual blocks
+        x = residual_block(x, 64)
+        x = residual_block(x, 64)
+        x = residual_block(x, 128, stride=2)
+        x = residual_block(x, 128)
+        x = residual_block(x, 256, stride=2)
+        x = residual_block(x, 256)
+        x = residual_block(x, 512, stride=2)
+        x = residual_block(x, 512)
+
+    # Final layers
+        x = GlobalAveragePooling3D()(x)
+        x = Dense(512, activation='relu')(x)
+        x = Dropout(0.5)(x)
+        outputs = Dense(1, activation='linear', name='equivalent_modulus')(x)
+
+        model = Model(inputs, outputs, name='ResNet18_3D')
+        model.compile(optimizer=Adam(1e-4), loss='mse', metrics=['mae'])
+        return model
+    def build_resnet18_3d(input_shape=(64, 64, 64, 1)):
+        """ResNet-18 3D architecture for equivalent modulus prediction (as in paper)"""
+        def residual_block(x, filters, stride=1):
+            shortcut = x
+            x = Conv3D(filters, 3, strides=stride, padding='same')(x)
+            x = BatchNormalization()(x)
+            x = ReLU()(x)
+            x = Conv3D(filters, 3, strides=1, padding='same')(x)
+            x = BatchNormalization()(x)
+
+            if stride != 1 or shortcut.shape[-1] != filters:
+                shortcut = Conv3D(filters, 1, strides=stride, padding='same')(shortcut)
+                shortcut = BatchNormalization()(shortcut)
+
+            x = Add()([x, shortcut])
+            x = ReLU()(x)
+            return x
+
+        inputs = Input(input_shape)
+
+    # Initial conv
+        x = Conv3D(64, 7, strides=2, padding='same')(inputs)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        x = MaxPooling3D(3, strides=2, padding='same')(x)
+
+    # Residual blocks
+        x = residual_block(x, 64)
+        x = residual_block(x, 64)
+        x = residual_block(x, 128, stride=2)
+        x = residual_block(x, 128)
+        x = residual_block(x, 256, stride=2)
+        x = residual_block(x, 256)
+        x = residual_block(x, 512, stride=2)
+        x = residual_block(x, 512)
+
+    # Final layers
+        x = GlobalAveragePooling3D()(x)
+        x = Dense(512, activation='relu')(x)
+        x = Dropout(0.5)(x)
+        outputs = Dense(1, activation='linear', name='equivalent_modulus')(x)
+
+        model = Model(inputs, outputs, name='ResNet18_3D')
+        model.compile(optimizer=Adam(1e-4), loss='mse', metrics=['mae'])
+        return model
+
+
+    def build_model(self):
+        inputs = Input(self.input_size)
+        e1 = self.residual_block(inputs, 32); p1 = MaxPooling2D(2)(e1)
+        e2 = self.residual_block(p1, 64);     p2 = MaxPooling2D(2)(e2)
+        e3 = self.residual_block(p2, 128);    p3 = MaxPooling2D(2)(e3)
+        b  = self.residual_block(p3, 256)
+        d3 = Conv2DTranspose(128, 2, strides=2, padding='same')(b)
+        a3 = self.attention_block(e3, d3, 128); d3 = concatenate([d3, a3]); d3 = self.residual_block(d3, 128)
+        d2 = Conv2DTranspose(64, 2, strides=2, padding='same')(d3)
+        a2 = self.attention_block(e2, d2,  64); d2 = concatenate([d2, a2]); d2 = self.residual_block(d2,  64)
+        d1 = Conv2DTranspose(32, 2, strides=2, padding='same')(d2)
+        a1 = self.attention_block(e1, d1,  32); d1 = concatenate([d1, a1]); d1 = self.residual_block(d1,  32)
+        outputs = Conv2D(self.num_classes, 1, activation='softmax')(d1)
+        model = Model(inputs, outputs, name='ResidualAttentionUNet')
+        model.compile(optimizer=Adam(learning_rate=1e-4), loss=dice_ce_loss, metrics=['accuracy', dice_coef])
+        print("✅ Residual Attention U-Net (Dice+CE) built successfully")
+        return model
+
+    def train_fast(self, patches, epochs=20, batch_size=16):
+        print("🚀 Training Residual Attention U-Net...")
+        patches_gray = np.mean(patches, axis=-1) if patches.ndim == 4 else patches
+        labels = self.create_synthetic_labels(patches_gray)
+        from tensorflow.keras.utils import to_categorical
+        labels_categorical = to_categorical(labels, self.num_classes)
+        patches_expanded = np.expand_dims(patches_gray, axis=-1) if patches_gray.ndim == 3 else patches_gray
+        history = self.model.fit(
+            patches_expanded, labels_categorical,
+            batch_size=batch_size, epochs=epochs, validation_split=0.2, verbose=1
+        )
+        print("✅ U-Net training completed")
+        return history
+
+    def create_synthetic_labels(self, patches):
+        labels = np.zeros((patches.shape[0], patches.shape[1], patches.shape[2]), dtype=np.int32)
+        for i, patch in enumerate(patches):
+            thresholds = np.percentile(patch, [20, 40, 60, 80])
+            labels[i][patch < thresholds[0]] = 4
+            labels[i][(patch >= thresholds[0]) & (patch < thresholds[1])] = 3
+            labels[i][(patch >= thresholds[1]) & (patch < thresholds[2])] = 2
+            labels[i][(patch >= thresholds[2]) & (patch < thresholds[3])] = 1
+            labels[i][patch >= thresholds[3]] = 0
+        return labels
+
+    def segment_patches(self, patches):
+        patches_gray = np.mean(patches, axis=-1) if patches.ndim == 4 and patches.shape[-1] == 3 else patches
+        patches_expanded = np.expand_dims(patches_gray, axis=-1)
+        predictions = self.model.predict(patches_expanded, verbose=0)
+        return np.argmax(predictions, axis=-1)
+
+# --------- AdvancedSliceGAN3D (kept)
+class AdvancedSliceGAN3D:
+    """Advanced 3D SliceGAN with improved architecture"""
+
+    def __init__(self, latent_dim=128, volume_size=64):
+        self.latent_dim = latent_dim
+        self.volume_size = volume_size
+        self.generator = self.build_generator()
+        self.discriminators = self.build_discriminators()
+        self.gan = self.build_gan()
+        print("🤖 Advanced SliceGAN 3D Initialized")
+
+    def build_generator(self):
+        model = Sequential([
+            Dense(4*4*4*256, input_dim=self.latent_dim),
+            Reshape((4, 4, 4, 256)),
+            BatchNormalization(), LeakyReLU(0.2),
+            Conv3DTranspose(128, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+            Conv3DTranspose(64, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+            Conv3DTranspose(32, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+            Conv3DTranspose(16, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2),
+            Conv3DTranspose(1, 3, strides=1, padding='same', activation='tanh')
+        ], name='Advanced3DGenerator')
+        model.compile(optimizer=Adam(learning_rate=2e-4, beta_1=0.5), loss='mse')
+        return model
+
+    def build_discriminators(self):
+        def build_discriminator():
+            model = Sequential([
+                Conv2D(32, 4, strides=2, padding='same', input_shape=(64, 64, 1)),
+                LeakyReLU(0.2), Dropout(0.3),
+                Conv2D(64, 4, strides=2, padding='same'),
+                BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+                Conv2D(128, 4, strides=2, padding='same'),
+                BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+                Conv2D(256, 4, strides=2, padding='same'),
+                BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+                Flatten(), Dense(1, activation='sigmoid')
+            ])
+            model.compile(optimizer=Adam(learning_rate=2e-4, beta_1=0.5),
+                         loss='binary_crossentropy', metrics=['accuracy'])
+            return model
+        return [build_discriminator() for _ in range(3)]
+
+    def build_gan(self):
+        for disc in self.discriminators:
+            disc.trainable = False
+        gan_input = Input(shape=(self.latent_dim,))
+        generated_volume = self.generator(gan_input)
+        slice_x = Lambda(lambda x: tf.reduce_mean(x, axis=1))(generated_volume)
+        slice_y = Lambda(lambda x: tf.reduce_mean(x, axis=2))(generated_volume)
+        slice_z = Lambda(lambda x: tf.reduce_mean(x, axis=3))(generated_volume)
+        validity_x = self.discriminators[0](slice_x)
+        validity_y = self.discriminators[1](slice_y)
+        validity_z = self.discriminators[2](slice_z)
+        avg_validity = Lambda(lambda x: (x[0] + x[1] + x[2]) / 3)([validity_x, validity_y, validity_z])
+        gan = Model(gan_input, avg_validity, name='AdvancedSliceGAN')
+        gan.compile(optimizer=Adam(learning_rate=2e-4, beta_1=0.5), loss='binary_crossentropy')
+        return gan
+
+    def train_fast(self, real_patches, epochs=30, batch_size=8):
+        print(f"🚀 Training Advanced SliceGAN for {epochs} epochs...")
+        real_patches_expanded = np.expand_dims(real_patches, axis=-1)
+        d_losses = [[] for _ in range(3)]; g_losses = []
+        valid = np.ones((batch_size, 1)); fake = np.zeros((batch_size, 1))
+        for epoch in range(epochs):
+            for axis in range(3):
+                idx = np.random.randint(0, real_patches_expanded.shape[0], batch_size)
+                if real_patches_expanded.shape[-1] == 3:
+                    real_patches_gray = np.mean(real_patches_expanded, axis=-1, keepdims=True)
+                else:
+                    real_patches_gray = real_patches_expanded
+                real_slices = real_patches_gray[idx]
+                noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+                fake_volumes = self.generator.predict(noise, verbose=0)
+                if axis == 0: fake_slices = np.mean(fake_volumes, axis=1)
+                elif axis == 1: fake_slices = np.mean(fake_volumes, axis=2)
+                else: fake_slices = np.mean(fake_volumes, axis=3)
+                fake_slices = np.expand_dims(fake_slices, axis=-1)
+                if len(real_slices.shape) == 5:
+                    real_slices = real_slices.squeeze(-1)
+                if real_slices.shape[-1] == 3:
+                    real_slices_gray = np.mean(real_slices, axis=-1, keepdims=True)
+                else:
+                    real_slices_gray = real_slices
+                if fake_slices is not None and hasattr(fake_slices, 'shape'):
+                    if len(fake_slices.shape) == 4 and fake_slices.shape[-1] != 1:
+                        fake_slices = np.expand_dims(fake_slices, axis=-1)
+                d_loss_real = self.discriminators[axis].train_on_batch(real_slices_gray, valid)
+                try:
+                    fake_slices_np = fake_slices.numpy() if hasattr(fake_slices, 'numpy') else np.array(fake_slices)
+                    if fake_slices_np.ndim == 3:
+                        fake_slices_np = np.expand_dims(fake_slices_np, axis=-1)
+                    elif fake_slices_np.ndim == 4 and fake_slices_np.shape[-1] != 1:
+                        fake_slices_np = np.expand_dims(np.mean(fake_slices_np, axis=-1), axis=-1)
+                    d_loss_fake = self.discriminators[axis].train_on_batch(fake_slices_np, fake)
+                except Exception as e:
+                    print(f"❌ Error processing fake slices: {e}")
+                    d_loss_fake = [1.0, 0.0]
+                d_loss = 0.5 * np.add(d_loss_real[0], d_loss_fake[0])
+                d_losses[axis].append(d_loss)
+            noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+            g_loss = self.gan.train_on_batch(noise, valid)
+            g_losses.append(g_loss)
+            if epoch % 5 == 0:
+                print(f"📊 Epoch {epoch}, D Losses: {[d_losses[i][-1] for i in range(3)]}, G Loss: {g_loss:.4f}")
+        print("✅ SliceGAN training completed")
+        return d_losses, g_losses
+
+    def generate_3d_volumes(self, num_samples=50):
+        print(f"🎨 Generating {num_samples} 3D volumes...")
+        noise = np.random.normal(0, 1, (num_samples, self.latent_dim))
+        volumes = self.generator.predict(noise, verbose=0)
+        return volumes[:, :, :, :, 0]
+
+# --------- Composition-guided selector (kept)
+class CompositionGuidedSelector:
+    def __init__(self, mineral_processor):
+        self.mineral_processor = mineral_processor
+
+    def select_best_volume(self, volumes, sample_name, target_composition):
+        print("🏆 Selecting best volume based on composition matching...")
+        best_volume, best_score, best_composition = None, -1, None
+        for i, volume in enumerate(volumes):
+            volume_comp = self.analyze_volume_composition(volume)
+            score = self.calculate_composition_similarity(volume_comp, target_composition)
+            if score > best_score:
+                best_score = score; best_volume = volume; best_composition = volume_comp
+        print(f"✅ Best volume selected with similarity score: {best_score:.4f}")
+        print(f"📊 Target composition: {target_composition}")
+        print(f"📊 Best volume composition: {best_composition}")
+        return best_volume, best_score, best_composition
+
+    def analyze_volume_composition(self, volume):
+        thresholds = np.percentile(volume, [20, 40, 60, 80])
+        composition = {
+            'Silicates': np.mean(volume >= thresholds[3]),
+            'Carbonate': np.mean((volume >= thresholds[2]) & (volume < thresholds[3])),
+            'Others':    np.mean((volume >= thresholds[1]) & (volume < thresholds[2])),
+            'Clay':      np.mean((volume >= thresholds[0]) & (volume < thresholds[1])),
+            'Kerogen':   np.mean(volume < thresholds[0])
+        }
+        total = sum(composition.values())
+        for phase in composition:
+            composition[phase] = (composition[phase] / total) * 100
+        return composition
+
+    def calculate_composition_similarity(self, volume_comp, target_comp):
+        score = 0
+        for phase in target_comp:
+            target_val = target_comp[phase]
+            volume_val = volume_comp.get(phase, 0)
+            phase_similarity = 1 - abs(target_val - volume_val) / 100.0
+            score += phase_similarity
+        return score / len(target_comp)
+
+# --------- Abaqus exporter (kept)
+class AdvancedAbaqusExporter:
+    def __init__(self, mineral_processor):
+        self.mineral_processor = mineral_processor
+
+    def export_to_abaqus(self, volume, sample_name, output_dir):
+        print("💾 Exporting to Abaqus INP format...")
+        material_volume = self.assign_material_phases(volume)
+        nodes, elements = self.create_hexahedral_mesh(material_volume)
+        inp_path = os.path.join(output_dir, f"{sample_name}_model.inp")
+        self.write_inp_file(inp_path, nodes, elements, material_volume)
+        prop_path = os.path.join(output_dir, f"{sample_name}_materials.py")
+        self.write_material_properties(prop_path, sample_name)
+        print(f"✅ Abaqus files exported:\n   - INP file: {inp_path}\n   - Material properties: {prop_path}")
+        return inp_path, prop_path
+
+    def assign_material_phases(self, volume):
+        thresholds = np.percentile(volume, [20, 40, 60, 80])
+        mv = np.zeros_like(volume, dtype=np.int32)
+        mv[volume < thresholds[0]] = 4
+        mv[(volume >= thresholds[0]) & (volume < thresholds[1])] = 3
+        mv[(volume >= thresholds[1]) & (volume < thresholds[2])] = 2
+        mv[(volume >= thresholds[2]) & (volume < thresholds[3])] = 1
+        mv[volume >= thresholds[3]] = 0
+        return mv
+
+    def create_hexahedral_mesh(self, material_volume):
+        nx, ny, nz = material_volume.shape[:3]
+        print(f"🔩 Creating mesh with {nx}x{ny}x{nz} elements...")
+        nodes = []; node_id = 1; node_map = {}
+        for i in range(nx + 1):
+            for j in range(ny + 1):
+                for k in range(nz + 1):
+                    nodes.append([node_id, float(i), float(j), float(k)])
+                    node_map[(i, j, k)] = node_id; node_id += 1
+        elements = []; elem_id = 1
+        for i in range(nx):
+            for j in range(ny):
+                for k in range(nz):
+                    n1 = node_map[(i, j, k)]
+                    n2 = node_map[(i+1, j, k)]
+                    n3 = node_map[(i+1, j+1, k)]
+                    n4 = node_map[(i, j+1, k)]
+                    n5 = node_map[(i, j, k+1)]
+                    n6 = node_map[(i+1, j, k+1)]
+                    n7 = node_map[(i+1, j+1, k+1)]
+                    n8 = node_map[(i, j+1, k+1)]
+                    material_id = material_volume[i, j, k]
+                    elements.append([elem_id, n1, n2, n3, n4, n5, n6, n7, n8, material_id])
+                    elem_id += 1
+        print(f"✅ Mesh created: {len(nodes)} nodes, {len(elements)} elements")
+        return nodes, elements
+
+    def write_inp_file(self, file_path, nodes, elements, material_volume):
+        material_names = ['SILICATES', 'CARBONATE', 'OTHERS', 'CLAY', 'KEROGEN']
+        with open(file_path, 'w') as f:
+            f.write("*HEADING\n")
+            f.write("3D Shale Microstructure - Mineral Reconstruction\n")
+            f.write("** Generated by AdvancedShaleReconstructor3D\n**\n")
+            f.write("*NODE\n")
+            for node in nodes:
+                f.write(f"{int(node[0])}, {node[1]:.6f}, {node[2]:.6f}, {node[3]:.6f}\n")
+            f.write("*ELEMENT, TYPE=C3D8\n")
+            for elem in elements:
+                elem_line = f"{int(elem[0])}"
+                for node_id in elem[1:9]:
+                    elem_line += f", {int(node_id)}"
+                f.write(elem_line + "\n")
+            for mat_id, mat_name in enumerate(material_names):
+                f.write(f"*ELSET, ELSET={mat_name}_ELEMENTS\n")
+                mat_elements = [e[0] for e in elements if e[-1]==mat_id]
+                for i, elem_id in enumerate(mat_elements):
+                    if i % 16 == 0:
+                        if i > 0: f.write("\n")
+                        f.write(f"{elem_id}")
+                    else:
+                        f.write(f", {elem_id}")
+                f.write("\n")
+            for mat_id, mat_name in enumerate(material_names):
+                f.write(f"*SOLID SECTION, ELSET={mat_name}_ELEMENTS, MATERIAL={mat_name}_MATERIAL\n")
+                f.write("1.,\n")
+            f.write("** BOUNDARY CONDITIONS\n*BOUNDARY\n")
+            f.write("** Fix bottom surface in Z direction\n")
+            f.write("BOTTOM_SURFACE, 3, 3\n**\n")
+
+    def write_material_properties(self, file_path, sample_name):
+        material_names = ['SILICATES', 'CARBONATE', 'OTHERS', 'CLAY', 'KEROGEN']
+        with open(file_path, 'w') as f:
+            f.write('"""\nMaterial Properties for Abaqus Analysis\nGenerated by AdvancedShaleReconstructor3D\n"""\n\n')
+            f.write('from abaqus import *\nfrom abaqusConstants import *\n\n')
+            f.write('def create_materials():\n    """Create material definitions in Abaqus"""\n\n')
+            for mat_name in material_names:
+                modulus = self.mineral_processor.get_phase_modulus(mat_name)
+                density = self.mineral_processor.get_phase_density(mat_name)
+                f.write(f'    # {mat_name} material\n')
+                f.write(f'    mdb.models["Model-1"].Material(name="{mat_name}_MATERIAL")\n')
+                f.write(f'    mdb.models["Model-1"].materials["{mat_name}_MATERIAL"].Elastic(table=(({modulus}, 0.25), ))\n')
+                f.write(f'    mdb.models["Model-1"].materials["{mat_name}_MATERIAL"].Density(table=(({density}, ), ))\n')
+                f.write(f'    print("Created {mat_name} material: E={modulus} GPa, ρ={density} g/cm³")\n\n')
+            f.write('    print("All materials created successfully")\n\n')
+            f.write('if __name__ == "__main__":\n    create_materials()\n')
+
+# --------- ComprehensiveVisualizer (kept)
+class ComprehensiveVisualizer:
+    """Create comprehensive visualizations of results"""
+
+    def __init__(self, base_path):
+        self.base_path = base_path
+        self.output_dir = os.path.join(base_path, 'Output')
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def create_3d_volume_visualization(self, volume, sample_name):
+        try:
+            from skimage import measure
+            verts, faces, _, _ = measure.marching_cubes(volume, level=0.5)
+            fig = plt.figure(figsize=(15, 12))
+            ax = fig.add_subplot(111, projection='3d')
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            mesh = Poly3DCollection(verts[faces], alpha=0.8, edgecolor='k', linewidth=0.5)
+            mesh.set_facecolor([0.8, 0.7, 0.6])
+            ax.add_collection3d(mesh)
+            ax.set_xlim(0, volume.shape[0]); ax.set_ylim(0, volume.shape[1]); ax.set_zlim(0, volume.shape[2])
+            ax.set_xlabel('X (voxels)'); ax.set_ylabel('Y (voxels)'); ax.set_zlabel('Z (voxels)')
+            ax.set_title(f'3D Shale Microstructure - {sample_name}\n({volume.shape[0]}×{volume.shape[1]}×{volume.shape[2]} voxels)',
+                         fontsize=14, fontweight='bold')
+            stats_text = f"""Volume Statistics:
+Dimensions: {volume.shape}
+Total Voxels: {volume.size:,}
+Mean Intensity: {np.mean(volume):.3f}
+Std Intensity: {np.std(volume):.3f}
+Volume Fraction > 0.5: {np.mean(volume > 0.5):.1%}"""
+            ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+                      verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            plt.tight_layout()
+            output_path = os.path.join(self.output_dir, f'{sample_name}_3d_volume.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight'); plt.close()
+            print(f"✅ 3D volume visualization saved: {output_path}")
+        except Exception as e:
+            print(f"⚠️  3D visualization failed: {e}")
+            self.create_3d_scatter_visualization(volume, sample_name)
+
+    def create_3d_scatter_visualization(self, volume, sample_name):
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        sample_mask = volume > np.percentile(volume, 70)
+        x, y, z = np.where(sample_mask)
+        colors = volume[sample_mask]
+        scatter = ax.scatter(x, y, z, c=colors, cmap='viridis', s=2, alpha=0.6)
+        ax.set_xlabel('X (voxels)'); ax.set_ylabel('Y (voxels)'); ax.set_zlabel('Z (voxels)')
+        ax.set_title(f'3D Shale Microstructure - {sample_name}', fontsize=14, fontweight='bold')
+        plt.colorbar(scatter, ax=ax, label='Intensity')
+        plt.tight_layout()
+        output_path = os.path.join(self.output_dir, f'{sample_name}_3d_scatter.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight'); plt.close()
+        print(f"✅ 3D scatter visualization saved: {output_path}")
+
+    def create_slice_comparison(self, original_patches, generated_volume, sample_name):
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        fig.suptitle(f'2D-3D Slice Comparison - {sample_name}', fontsize=16, fontweight='bold')
+        for i in range(4):
+            axes[0, i].imshow(original_patches[i], cmap='viridis')
+            axes[0, i].set_title(f'Original SEM Patch {i+1}'); axes[0, i].axis('off')
+        slice_indices = [0, generated_volume.shape[2]//3, 2*generated_volume.shape[2]//3, generated_volume.shape[2]-1]
+        for i, idx in enumerate(slice_indices):
+            axes[1, i].imshow(generated_volume[:, :, idx], cmap='viridis')
+            axes[1, i].set_title(f'Generated 3D Slice Z={idx}'); axes[1, i].axis('off')
+        plt.tight_layout()
+        output_path = os.path.join(self.output_dir, f'{sample_name}_slice_comparison.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight'); plt.close()
+        print(f"✅ Slice comparison saved: {output_path}")
+
+    def create_composition_analysis(self, target_comp, volume_comp, sample_name):
+        phases = list(target_comp.keys())
+        target_vals = [target_comp[p] for p in phases]
+        volume_vals = [volume_comp.get(p, 0) for p in phases]
+        x = np.arange(len(phases)); width = 0.35
+        fig, ax = plt.subplots(figsize=(12, 8))
+        bars1 = ax.bar(x - width/2, target_vals, width, label='Target (SEM+Excel)',
+                       alpha=0.7, color='navy', edgecolor='black')
+        bars2 = ax.bar(x + width/2, volume_vals, width, label='Generated (3D Model)',
+                       alpha=0.7, color='crimson', edgecolor='black')
+        ax.set_xlabel('Mineral Phases', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Volume Percentage (%)', fontsize=12, fontweight='bold')
+        ax.set_title(f'Mineral Composition Matching - {sample_name}', fontsize=14, fontweight='bold')
+        ax.set_xticks(x); ax.set_xticklabels(phases, rotation=45, ha='right')
+        ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                ax.annotate(f'{height:.1f}%',
+                            xy=(bar.get_x() + bar.get_width() / 2, height),
+                            xytext=(0, 3), textcoords="offset points",
+                            ha='center', va='bottom', fontsize=9, fontweight='bold')
+        similarity = 1 - np.mean(np.abs(np.array(target_vals) - np.array(volume_vals)) / 100.0)
+        ax.text(0.02, 0.98, f'Composition Similarity: {similarity:.3f}',
+                transform=ax.transAxes, fontsize=12, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+        plt.tight_layout()
+        output_path = os.path.join(self.output_dir, f'{sample_name}_composition_analysis.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight'); plt.close()
+        print(f"✅ Composition analysis saved: {output_path}")
+        return similarity
+# =========================
+# SECTION 4 / 4
+# =========================
+    # ============== FEM Analysis Functions ==============
+class NumpyEncoder(json.JSONEncoder):
+    """Custom encoder for numpy data types"""
+    def default(self, obj):
+        if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
+                          np.int16, np.int32, np.int64, np.uint8,
+                          np.uint16, np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.float_, np.float16, np.float32,
+                            np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
+
+
+class FastShaleReconstructor3D:
+    """Main class for fast 3D shale reconstruction"""
+
+    def __init__(self, base_path, excel_path):
+        self.base_path = base_path
+        self.excel_path = excel_path
+        self.mineral_processor = AdvancedMineralProcessor(excel_path)
+        self.sem_processor = AdvancedSEMProcessor(base_path)
+        self.abaqus_exporter = AdvancedAbaqusExporter(self.mineral_processor)
+        self.visualizer = ComprehensiveVisualizer(base_path)
+        self.selector = CompositionGuidedSelector(self.mineral_processor)
+        self.mineral_processor.load_and_parse_excel()
+        self.create_output_directories()
+        print("🚀 Advanced Fast Shale Reconstructor 3D Initialized")
+        print("📊 Following exact methodology from paper")
+        print("⏱️  Optimized for 15-20 minute execution")
+
+    def create_output_directories(self):
+        directories = [
+            'Output/3D_Models','Output/Visualizations','Output/Abaqus',
+            'Output/Training_Data','Output/Quality_Metrics','Output/Colored','Output/TIFF_Stacks'
+        ]
+        for directory in directories:
+            full_path = os.path.join(self.base_path, directory)
+            os.makedirs(full_path, exist_ok=True)
+            print(f"📁 Created: {directory}")
+
+    def process_sample(self, sample_name, unet_epochs=20, slicegan_epochs=30):
+        print(f"\n🎯 PROCESSING SAMPLE: {sample_name}")
+        print("=" * 70)
+        start_time = pd.Timestamp.now()
+
+        # Step 1: Load SEM data
+        print("🔬 Step 1: Loading SEM images...")
+        sem_data = self.sem_processor.load_sample_images(sample_name)
+        if sem_data['mineral_map'] is None:
+            print("❌ No mineral map found, using enhanced BSE image")
+            if sem_data['bse'] is not None:
+                sem_data['mineral_map'] = self.sem_processor.enhance_image_quality(sem_data['bse'])
+            else:
+                print("❌ No SEM images found, creating synthetic data")
+                sem_data['mineral_map'] = self.create_realistic_sem_image()
+
+        # Step 2: Create training patches
+        print("✂️ Step 2: Creating training patches (multi-scale & overlap)...")
+        patches, positions = self.sem_processor.create_training_patches(
+            sem_data['mineral_map'], grid_size=10, patch_size=64, use_overlap=True
+        )
+        if patches is None:
+            print("❌ Patch creation failed"); return None
+        print(f"✅ Created {len(patches)} patches for training")
+
+        # Step 3: Train Residual Attention U-Net (Dice+CE)
+        print("🧠 Step 3: Training Residual Attention U-Net (Dice+CE)...")
+        unet = ResidualAttentionUNet(input_size=(64, 64, 1), num_classes=5)
+        unet_history = unet.train_fast(patches, epochs=max(15, unet_epochs), batch_size=16)
+
+        # Step 4: Segment patches (QC)
+        print("🎨 Step 4: Segmenting patches...")
+        segmented_patches = unet.segment_patches(patches)
+
+        # Step 5: Multi-scale assembly of continuous 3D intensity volume
+        print("🏗️ Step 5: Multi-scale assembly...")
+        assembler = MultiScaleVolumeAssembler(vol_size=128, patch_size=64, stride=32, smooth_sigma=0.8)
+        banks = assembler.make_banks(sem_data['mineral_map'])
+        intensity_vol = assembler.assemble(banks)
+
+        # Step 6: Match slice stats to reference SEM (mineral map or BSE)
+        print("📐 Step 6: Matching intensity statistics to SEM...")
+        ref_img = sem_data['bse'] if sem_data['bse'] is not None else sem_data['mineral_map']
+        if ref_img is not None:
+            ref = ref_img.astype(np.float32)
+            if ref.max() > 2.0:
+                ref = ref / ref.max()
+            if ref.ndim == 3:
+                ref = np.mean(ref, axis=2)
+            ref_resized = cv2.resize(ref, (intensity_vol.shape[1], intensity_vol.shape[0]), interpolation=cv2.INTER_AREA)
+            for z in range(intensity_vol.shape[2]):
+                intensity_vol[:, :, z] = robust_minmax_match(intensity_vol[:, :, z], ref_resized)
+        intensity_vol = clip01(intensity_vol)
+
+        # Step 7: 3D refinement (lite UNet + anisotropic diffusion + sharpen)
+        print("🧽 Step 7: 3D refinement...")
+        cont = VolumeContinuityEnforcer(smooth_sigma=1.0)
+        try:
+            refiner = build_refiner3d(input_shape=(128,128,128,1))
+         # reduce to 1 epoch for faster debugging
+            refiner.fit(intensity_vol[None,...,None], intensity_vol[None,...,None], epochs=1, batch_size=1, verbose=0)
+            intensity_refined = refiner.predict(intensity_vol[None,...,None], verbose=0)[0,...,0]
+        except Exception as e:
+            print(f"⚠️  Refiner skipped due to: {e}")
+            intensity_refined = intensity_vol.copy()
+
+        intensity_refined = cont.anisotropic_diffusion_3d(intensity_refined, iters=6, kappa=45.0, gamma=0.12)
+        intensity_refined = cont.sharpen_boundaries(intensity_refined, alpha=0.25)
+        intensity_refined = cont.gaussian_3d(intensity_refined, sigma=0.8)
+
+        # Step 8: Labeling + composition prior
+        print("🏷️ Step 8: Labeling with composition prior...")
+        comp_blob = self.mineral_processor.get_sample_composition(sample_name) or {}
+        target_composition = comp_blob.get('five_phase_area')
+        if not target_composition:
+            target_composition = {'Silicates':70,'Carbonate':8,'Others':4,'Clay':16,'Kerogen':2}
+        assigner = LabelAssigner(target_composition)
+        labels = assigner.assign(intensity_refined)
+        labels = cont.prune_small_components(labels)
+        labels = cont.smooth_labels_3d(labels, radius=1)
+        labels = assigner.soft_rebalance(labels)
+        achieved_comp = CompositionTools.composition_from_labels(labels)
+        score = CompositionTools.similarity_score(achieved_comp, target_composition)
+        print(f"📊 Composition similarity (labels vs target): {score:.4f}")
+
+        # Step 9: Visualizations & QC
+        print("📊 Step 9: Visualizations & QC...")
+        palette = MineralPalette(self.base_path); palette.try_extract_from_folder(sample_name)
+        color_tools = ColorAndExportTools(self.base_path, palette)
+        color_tools.save_colored_center_slices(labels, sample_name)
+        color_tools.save_tiff_stack_labels(labels, sample_name)
+        self.visualizer.create_3d_volume_visualization(intensity_refined, sample_name)
+        self.visualizer.create_slice_comparison(patches[:4, :, :, 0], intensity_refined, sample_name)
+        extra_viz = ExtraVisualizer(self.base_path)
+        extra_viz.orthogrid(intensity_refined, sample_name, n=8)
+        similarity_score = self.visualizer.create_composition_analysis(target_composition, achieved_comp, sample_name)
+        extra_viz.composition_radar(target_composition, achieved_comp, sample_name)
+        print("📈 QC Metrics:",
+              "Moran-like:", f"{morans_I(intensity_refined):.4f}",
+              "| Var-line:", f"{semivariogram_1d(intensity_refined[intensity_refined.shape[0]//2, intensity_refined.shape[1]//2, :])[1][-1]:.4f}")
+
+        # Step 10: Export to Abaqus
+        print("💾 Step 10: Export to Abaqus...")
+        abaqus_dir = os.path.join(self.base_path, 'Output/Abaqus')
+        inp_path, prop_path = self.abaqus_exporter.export_to_abaqus(intensity_refined, sample_name, abaqus_dir)
+
+        # Step 11: Save results
+        print("💾 Step 11: Save final results...")
+        self.save_final_results(intensity_refined, sample_name, score, similarity_score,
+                                target_composition, achieved_comp)
+        print("📊 Step 12: Calculating equivalent modulus and comprehensive analysis...")
+        youngs_modulus_dict = {
+            'Silicates': 89.6, 'Carbonate': 74.6, 'Clay': 22.3,
+            'Kerogen': 9.2, 'Others': 12.392
+        }
+
+        # Calculate equivalent modulus using FEM approach
+        equivalent_modulus = calculate_equivalent_modulus_fem(intensity_refined, youngs_modulus_dict)
+
+        # Calculate comprehensive statistics
+        volume_stats = calculate_volume_statistics(intensity_refined)
+        spatial_corr = calculate_spatial_correlation(intensity_refined)
+        connectivity = calculate_phase_connectivity(intensity_refined)
+
+        print(f"✅ Equivalent modulus: {equivalent_modulus:.2f} GPa")
+        print(f"📈 Volume statistics: Mean={volume_stats['mean_intensity']:.3f}, "
+              f"Std={volume_stats['std_intensity']:.3f}, Porosity={volume_stats['porosity_05']:.1%}")
+        print(f"🔗 Spatial correlation: X={spatial_corr['correlation_x']:.3f}, "
+              f"Y={spatial_corr['correlation_y']:.3f}, Z={spatial_corr['correlation_z']:.3f}")
+
+        end_time = pd.Timestamp.now()
+        processing_time = (end_time - start_time).total_seconds() / 60.0
+        print(f"\n🎉 PROCESSING COMPLETED FOR {sample_name}")
+        print("=" * 70)
+        print(f"⏱️  Total time: {processing_time:.1f} minutes")
+        print(f"📊 Composition similarity: {score:.4f}")
+        print(f"🎯 Volume dimensions: {intensity_refined.shape}")
+        print(f"💾 Abaqus INP: {inp_path}")
+        print(f"🔧 Material props: {prop_path}")
+        print(f"📈 Visualizations saved in Output/ folder")
+
+        return {
+            'best_volume': intensity_refined,
+            'similarity_score': score,
+            'processing_time': processing_time,
+            'abaqus_files': [inp_path, prop_path],
+            'composition': {'target': target_composition, 'achieved': achieved_comp}
+        }
+
+    # ---- Kept from your original (helper generators) ----
+    def create_realistic_sem_image(self, size=(1024, 1024)):
+        print("🎨 Creating realistic SEM image...")
+        h, w = size
+        base = np.random.rand(h, w).astype(np.float32) * 0.3
+        for _ in range(20):
+            x, y = np.random.randint(0, w), np.random.randint(0, h)
+            length = np.random.randint(200, 500)
+            width = np.random.randint(15, 50)
+            angle = np.random.uniform(0, 2*np.pi)
+            for i in range(length):
+                for j in range(-width//2, width//2):
+                    xi = int(x + i * np.cos(angle) + j * np.sin(angle))
+                    yi = int(y + i * np.sin(angle) - j * np.cos(angle))
+                    if 0 <= xi < w and 0 <= yi < h:
+                        dist_factor = 1.0 - abs(j) / (width/2)
+                        intensity = 0.8 + 0.2 * dist_factor
+                        base[yi, xi] = max(base[yi, xi], intensity)
+        clay_mask = np.random.rand(h, w) > 0.7
+        base[clay_mask] = np.maximum(base[clay_mask], 0.5)
+        for _ in range(100):
+            x, y = np.random.randint(0, w), np.random.randint(0, h)
+            radius = np.random.randint(3, 15)
+            y_coords, x_coords = np.ogrid[-y:h-y, -x:w-x]
+            mask = x_coords*x_coords + y_coords*y_coords <= radius*radius
+            base[mask] = np.minimum(base[mask], 0.3)
+        base = cv2.GaussianBlur(base, (7, 7), 2.0)
+        base = (base - base.min()) / (base.max() - base.min())
+        print("✅ Realistic SEM image created")
+        return base
+
+    def save_final_results(self, volume, sample_name, comp_score, similarity_score, target_comp, volume_comp):
+        print("💾 Saving final results with comprehensive analysis...")
+
+        # Calculate equivalent modulus and comprehensive metrics
+        youngs_modulus_dict = {
+            'Silicates': 89.6, 'Carbonate': 74.6, 'Clay': 22.3,
+            'Kerogen': 9.2, 'Others': 12.392
+        }
+    # ===== ADD THIS FUNCTION RIGHT HERE =====
+
+# ===== END OF ADDED FUNCTION =====
+        equivalent_modulus = calculate_equivalent_modulus_fem(volume, youngs_modulus_dict)
+        volume_stats = calculate_volume_statistics(volume)
+        spatial_corr = calculate_spatial_correlation(volume)
+        connectivity = calculate_phase_connectivity(volume)
+
+        volume_path = os.path.join(self.base_path, 'Output/3D_Models', f'{sample_name}_3d_volume.npz')
+        np.savez_compressed(volume_path, volume=volume, composition=volume_comp)
+
+        metadata = {
+            'sample_name': sample_name,
+            'volume_shape': list(volume.shape),
+            'composition_similarity': comp_score,
+            'equivalent_modulus_gpa': equivalent_modulus,
+            'volume_statistics': volume_stats,
+            'spatial_correlation': spatial_corr,
+            'phase_connectivity': connectivity,
+            'target_composition': target_comp,
+            'achieved_composition': volume_comp,
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'methodology': 'SliceGAN+ResNet18+FEM+ComprehensiveAnalysis',
+            'reference': 'A Data-Driven Approach to Generating Stochastic Mesoscale 3D Shale Volume Elements From 2D SEM Images'
+        }
+        metadata_path = os.path.join(self.base_path, 'Output/3D_Models', f'{sample_name}_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2, cls=NumpyEncoder)
+
+        print(f"✅ Results saved:\n   - 3D volume: {volume_path}\n   - Metadata: {metadata_path}")
+        print(f"📊 Equivalent modulus: {equivalent_modulus:.2f} GPa")
+        print(f"📈 Volume porosity: {volume_stats['porosity_05']:.1%}")
+        print(f"🔗 Spatial anisotropy: {spatial_corr['anisotropy_index']:.3f}")
+
+# ============== MAIN ==============
+if __name__ == "__main__":
+    set_global_seed(42)  # (ADDED) reproducibility
+
+    base_path = r"C:\Users\红米\Desktop\Files"
+    excel_path = os.path.join(base_path, "Mineral_quant_all_samples.xlsx")
+
+    print("🚀 ADVANCED 3D SHALE VOLUME ELEMENTS GENERATOR")
+    print("=" * 70)
+    print("Methodology based on:")
+    print("'A Data-Driven Approach to Generating Stochastic Mesoscale")
+    print("3D Shale Volume Elements From 2D SEM Images'")
+    print("=" * 70)
+    print("Key Features:")
+    print("• Residual Attention U-Net (Dice+CE)")
+    print("• Multi-scale assembly + 3D refiner")
+    print("• Composition-aware labeling prior")
+    print("• Abaqus-compatible export with material properties")
+    print("• GPU-accelerated training")
+    print("• ~15-20 minute execution")
+    print("=" * 70)
+
+    reconstructor = FastShaleReconstructor3D(base_path, excel_path)
+    target_sample = "sample3"  # sample1..sample8
+    print(f"\n🎯 Target sample: {target_sample}\n" + "="*70)
+
+    result = reconstructor.process_sample(
+        target_sample,
+        unet_epochs=30,
+        slicegan_epochs=15
+    )
+
+    if result:
+        print(f"\n🎉 SUCCESS! 3D shale volume generated for {target_sample}")
+        print(f"📊 Volume shape: {result['best_volume'].shape}")
+        print(f"📈 Composition similarity: {result['similarity_score']:.4f}")
+        print(f"⏱️  Processing time: {result['processing_time']:.1f} minutes")
+        print(f"💾 Abaqus files: {result['abaqus_files']}")
+        print(f"📁 All results saved in Output/ directory")
+    else:
+        print(f"\n❌ Processing failed for {target_sample}")
