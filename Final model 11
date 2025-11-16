@@ -1,0 +1,1867 @@
+import time
+import os
+import sys
+import gc
+import warnings
+import random
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+from scipy import ndimage
+from scipy.linalg import sqrtm
+import tifffile
+from skimage.morphology import ball
+from collections import OrderedDict
+from dataclasses import dataclass
+from functools import lru_cache
+import json
+# Configure TensorFlow for maximum GPU usage
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_GPU_THREAD_COUNT'] = '2'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['TF_ENABLE_AUTO_MIXED_PRECISION'] = '1'
+os.environ['TF_USE_CUDNN'] = 'true'
+os.environ['TF_CUDNN_USE_AUTOTUNE'] = '1'
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, Model, Sequential
+from tensorflow.keras.layers import (Conv2D, Conv3D, Conv2DTranspose, Conv3DTranspose,
+                                   MaxPooling2D, MaxPooling3D, UpSampling2D, UpSampling3D,
+                                   BatchNormalization, LayerNormalization,
+                                   Dense, Flatten, Reshape, Input, Add, Multiply,
+                                   Concatenate, Dropout, ReLU, LeakyReLU, Activation,
+                                   GlobalAveragePooling2D, GlobalAveragePooling3D,
+                                   ZeroPadding3D, Cropping3D, SpatialDropout3D)
+from tensorflow.keras.optimizers import Adam, RMSprop
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.mixed_precision import Policy, set_global_policy
+import tensorflow.compat.v1 as tf_v1
+from tensorflow.keras.utils import Sequence
+import tensorflow.keras.backend as K
+from scipy import ndimage
+from scipy.spatial import cKDTree
+from skimage import measure, morphology, segmentation
+from skimage.filters import gaussian, sobel
+from skimage.feature import canny
+import meshio
+# Suppress Keras warnings about input_shape
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='keras.*')
+# Add these imports
+try:
+    import pyvista as pv
+    PYVISTA_AVAILABLE = True
+except ImportError:
+    PYVISTA_AVAILABLE = False
+    print("⚠️ PyVista not available, some mesh features disabled")
+
+try:
+    from pyacvd import Clustering
+    PYACVD_AVAILABLE = True
+except ImportError:
+    PYACVD_AVAILABLE = False
+    print("⚠️ PyACVD not available, mesh simplification disabled")
+# Configure GPU memory growth and mixed precision
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Set memory growth first
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+
+        # Set larger memory limit (adjust based on your GPU)
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+
+        # Enable mixed precision for better performance
+        policy = Policy('mixed_float16')
+        set_global_policy(policy)
+
+        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+        print(f"🔧 TensorFlow version: {tf.__version__}")
+        gpu_devices = tf.config.experimental.list_physical_devices('GPU')
+        print(f"🎯 Available GPUs: {len(gpu_devices)}")
+
+        if len(gpu_devices) == 0:
+            print("⚠️ No GPU detected, using CPU. Training will be slower.")
+            # Set CPU-only configuration
+            tf.config.set_visible_devices([], 'GPU')
+        print(f"✅ Using {len(gpus)} GPUs with mixed precision")
+        print(f"🎯 Logical GPUs: {len(logical_gpus)}")
+
+        # Use MirroredStrategy for multi-GPU
+        if len(logical_gpus) > 1:
+            strategy = tf.distribute.MirroredStrategy()
+            print(f'🔧 Number of devices: {strategy.num_replicas_in_sync}')
+        else:
+            strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
+
+    except RuntimeError as e:
+        print(f"❌ GPU configuration error: {e}")
+        strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
+else:
+    strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
+
+print(f"🔧 TensorFlow version: {tf.__version__}")
+print(f"🎯 Available GPUs: {len(tf.config.experimental.list_physical_devices('GPU'))}")
+
+# -------------------------
+# Core Helper Functions
+# -------------------------
+# -------------------------
+# Output/Path Utilities (NEW)
+# -------------------------
+def ensure_project_dirs(base_path):
+    td = os.path.join(base_path, "Training_Data")
+    vz = os.path.join(base_path, "Visualisations")
+    ts = os.path.join(base_path, "tiff_stack")
+    ab = os.path.join(base_path, "abaqus")
+    for p in [td, vz, ts, ab]:
+        os.makedirs(p, exist_ok=True)
+    return {"Training_Data": td, "Visualisations": vz, "tiff_stack": ts, "abaqus": ab}
+
+def save_png_grid(images, grid=(10,10), tile_size=64, out_path="grid.png", cmap='gray'):
+    """
+    Make a montage to visually inspect patches/outputs.
+    images: [N,H,W] or [N,H,W,1] in [0,1] or [0,255]
+    """
+    imgs = images.copy()
+    if imgs.ndim == 4 and imgs.shape[-1] == 1:
+        imgs = imgs[...,0]
+    imgs = imgs.astype(np.float32)
+    if imgs.max() > 1.0: imgs /= 255.0
+    rows, cols = grid
+    H, W = tile_size, tile_size
+    canvas = np.zeros((rows*H, cols*W), dtype=np.float32)
+    for idx in range(min(rows*cols, imgs.shape[0])):
+        r, c = divmod(idx, cols)
+        tile = cv2.resize(imgs[idx], (W, H), interpolation=cv2.INTER_AREA)
+        canvas[r*H:(r+1)*H, c*W:(c+1)*W] = tile
+    plt.figure(figsize=(cols*1.2, rows*1.2))
+    plt.imshow(canvas, cmap=cmap)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close()
+def set_global_seed(seed: int = 42):
+    """Deterministic runs across numpy/tensorflow/python hash."""
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+def safe_makedirs(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def normalize01(x, eps=1e-8):
+    x = x.astype(np.float32)
+    mn, mx = np.min(x), np.max(x)
+    return (x - mn) / (mx - mn + eps)
+
+def clip01(x):
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
+
+def robust_minmax_match(src, ref, eps=1e-6):
+    """Histogram match using percentile anchors for robustness."""
+    s1, s99 = np.percentile(src, 1), np.percentile(src, 99)
+    r1, r99 = np.percentile(ref, 1), np.percentile(ref, 99)
+    out = (src - s1) / (s99 - s1 + eps)
+    return clip01(out) * (r99 - r1) + r1
+
+def patchify_2d(img, patch_size=64, stride=64):
+    """Return (N, H, W) patches + (y,x) positions."""
+    H, W = img.shape[:2]
+    ps, st = patch_size, stride
+    patches, pos = [], []
+    for y in range(0, max(H-ps+1, 1), st):
+        for x in range(0, max(W-ps+1, 1), st):
+            yy, xx = min(y, H-ps), min(x, W-ps)
+            patches.append(img[yy:yy+ps, xx:xx+ps])
+            pos.append((yy, xx))
+    return np.stack(patches, 0), pos
+
+def gaussian3d_kernel(size=5, sigma=1.0):
+    ax = np.arange(-size//2 + 1., size//2 + 1.)
+    xx, yy, zz = np.meshgrid(ax, ax, ax, indexing="ij")
+    k = np.exp(-(xx**2 + yy**2 + zz**2)/(2.*sigma**2))
+    return k / np.sum(k)
+
+# -------------------------
+# Advanced Quality Metrics
+# -------------------------
+
+def calculate_fid_score(real_images, generated_images):
+    """Calculate FID score exactly as in paper"""
+    try:
+        from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
+        # Load pre-trained InceptionV3
+        inception = InceptionV3(include_top=False, pooling='avg', input_shape=(299, 299, 3))
+
+        # Preprocess images
+        def preprocess_images(images):
+            if images.ndim == 3:
+                images = np.stack([images]*3, axis=-1)
+            images_resized = np.array([cv2.resize(img, (299, 299)) for img in images])
+            return preprocess_input(images_resized)
+
+        real_processed = preprocess_images(real_images)
+        gen_processed = preprocess_images(generated_images)
+
+        # Get features
+        real_features = inception.predict(real_processed, verbose=0)
+        gen_features = inception.predict(gen_processed, verbose=0)
+
+        # Calculate FID
+        mu_real, sigma_real = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
+        mu_gen, sigma_gen = gen_features.mean(axis=0), np.cov(gen_features, rowvar=False)
+
+        ssdiff = np.sum((mu_real - mu_gen)**2.0)
+        covmean = sqrtm(sigma_real.dot(sigma_gen))
+
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+
+        fid = ssdiff + np.trace(sigma_real + sigma_gen - 2.0 * covmean)
+        return float(fid)
+    except ImportError:
+        print("⚠️ TensorFlow not available, using simplified FID")
+        return calculate_simplified_fid(real_images, generated_images)
+
+def calculate_simplified_fid(real_images, generated_images):
+    """Simplified FID calculation without TensorFlow"""
+    real_features = real_images.reshape(real_images.shape[0], -1)
+    gen_features = generated_images.reshape(generated_images.shape[0], -1)
+
+    mu_real, sigma_real = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
+    mu_gen, sigma_gen = gen_features.mean(axis=0), np.cov(gen_features, rowvar=False)
+
+    ssdiff = np.sum((mu_real - mu_gen)**2.0)
+    fid = ssdiff + np.trace(sigma_real + sigma_gen - 2.0 * sqrtm(sigma_real.dot(sigma_gen)).real)
+    return float(fid)
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder for numpy data types"""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.bool_)):
+            return bool(obj)
+        return super().default(obj)
+class RealisticSEMDataGenerator:
+    """Generate realistic SEM-like training data from actual mineral maps"""
+
+    def __init__(self, base_path, sample_name):
+        self.base_path = base_path
+        self.sample_name = sample_name
+        self.mineral_processor = AdvancedMineralProcessor("Mineral_quant_all_samples.xlsx")
+        self.mineral_processor.load_and_parse_excel()
+
+    def load_mineral_map(self):
+        """Load mineral map; tolerate various file names & folders."""
+        sample_folder = os.path.join(self.base_path, self.sample_name)
+        candidates = [
+            "Mineral_map.tif", "mineral_map.tif", "MineralMap.tif",
+            "Mineral_map.tiff", "mineral_map.tiff"
+        ]
+        # check sample root
+        for nm in candidates:
+            p = os.path.join(sample_folder, nm)
+            if os.path.exists(p):
+                mm = tifffile.imread(p)
+                print(f"📊 Loaded mineral map: {mm.shape} from {p}")
+                return mm
+        # check Minerals subfolder, common exports put it there
+        minerals_dir = os.path.join(sample_folder, "Minerals")
+        if os.path.isdir(minerals_dir):
+            for f in os.listdir(minerals_dir):
+                if "mineral" in f.lower() and "map" in f.lower() and f.lower().endswith((".tif",".tiff")):
+                    p = os.path.join(minerals_dir, f)
+                    mm = tifffile.imread(p)
+                    print(f"📊 Loaded mineral map: {mm.shape} from {p}")
+                    return mm
+        print("❌ Mineral map not found")
+        return None
+
+    def load_bse_image(self):
+        """Load and process the BSE image with fallback options"""
+        bse_path = self.find_bse_image()
+        if bse_path:
+            bse_image = tifffile.imread(bse_path)
+            print(f"📊 Loaded BSE image: {bse_image.shape} from {bse_path}")
+
+            # Convert to grayscale if needed
+            if len(bse_image.shape) == 3:
+                bse_image = np.mean(bse_image, axis=2)
+
+            return bse_image
+        else:
+            print(f"⚠️ BSE image not found, will use mineral map only")
+            return None
+
+    def divide_into_patches(self, image, target_patch_size=64):
+        """Divide image into patches; for 1024x1024 force EXACT 10x10=100 patches."""
+        if image is None:
+            return [], []
+
+        if image.ndim == 3:
+            image = image.mean(axis=2).astype(np.float32)
+
+        h, w = image.shape[:2]
+        patches, positions = [], []
+
+        if h == 1024 and w == 1024:
+            # Force 10x10 tiles; use 1024//10 = 102 with small overlaps on last tiles
+            base = 102
+            for r in range(10):
+                for c in range(10):
+                    y0 = r*base
+                    x0 = c*base
+                    y1 = min(y0+base, 1024)
+                    x1 = min(x0+base, 1024)
+                    # avoid shrinking last tiles; pad then crop to stable 102x102
+                    tile = image[y0:y1, x0:x1]
+                    if tile.shape != (base, base):
+                        pad = ((0, base - tile.shape[0]), (0, base - tile.shape[1]))
+                        tile = np.pad(tile, pad, mode='edge')
+                    # resize to model patch
+                    tile = cv2.resize(tile, (target_patch_size, target_patch_size), interpolation=cv2.INTER_AREA)
+                    patches.append(tile.astype(np.float32))
+                    positions.append((r, c))
+            return patches, positions
+
+        # generic grid
+        grid_rows = max(1, h // target_patch_size)
+        grid_cols = max(1, w // target_patch_size)
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                y0 = r*target_patch_size
+                x0 = c*target_patch_size
+                y1 = min(y0+target_patch_size, h)
+                x1 = min(x0+target_patch_size, w)
+                tile = image[y0:y1, x0:x1]
+                if tile.shape != (target_patch_size, target_patch_size):
+                    tile = cv2.resize(tile, (target_patch_size, target_patch_size), interpolation=cv2.INTER_AREA)
+                patches.append(tile.astype(np.float32))
+                positions.append((r, c))
+        return patches, positions
+
+
+
+    def create_training_patches(self, num_patches=1000, target_patch_size=64):
+        """Create realistic training patches from actual SEM data with consistent size"""
+        print(f"🎨 Creating realistic training patches for {self.sample_name}")
+
+        mineral_map = self.load_mineral_map()
+        bse_image = self.load_bse_image()
+
+        all_patches = []
+
+        # Use mineral map patches with consistent size - PRIORITIZE REAL DATA
+        if mineral_map is not None:
+            mineral_patches, mineral_positions = self.divide_into_patches(mineral_map, target_patch_size)
+            if mineral_patches:
+                all_patches.extend(mineral_patches)
+                print(f"✅ Added {len(mineral_patches)} mineral map patches ({target_patch_size}x{target_patch_size})")
+
+        # Use BSE image patches with consistent size
+        if bse_image is not None:
+            bse_patches, bse_positions = self.divide_into_patches(bse_image, target_patch_size)
+            if bse_patches:
+                all_patches.extend(bse_patches)
+                print(f"✅ Added {len(bse_patches)} BSE image patches ({target_patch_size}x{target_patch_size})")
+
+        # If we have enough real patches (like 100 from 1024x1024), use them directly
+        if len(all_patches) >= 100:
+            print(f"🎯 Using {len(all_patches)} real patches for training")
+            # Use only real patches for better quality
+            all_patches = all_patches[:num_patches]
+        else:
+            # If we don't have enough real patches, create synthetic ones
+            current_count = len(all_patches)
+            if current_count < num_patches or current_count == 0:
+                additional_needed = max(num_patches - current_count, num_patches)
+                print(f"🔄 Creating {additional_needed} additional synthetic patches ({target_patch_size}x{target_patch_size})")
+                synthetic_patches = self.create_synthetic_patches(additional_needed, target_patch_size)
+                all_patches.extend(synthetic_patches)
+
+            # Ensure we have the right number of patches
+            all_patches = all_patches[:num_patches]
+
+        # Verify all patches have the same size
+        patch_shapes = set(patch.shape for patch in all_patches)
+        if len(patch_shapes) > 1:
+            print(f"⚠️ Inconsistent patch shapes: {patch_shapes}")
+            # Resize all patches to target size
+            all_patches = [cv2.resize(patch, (target_patch_size, target_patch_size))
+                          if patch.shape != (target_patch_size, target_patch_size) else patch
+                          for patch in all_patches]
+
+        # Convert to numpy array and normalize
+        try:
+            patches_array = np.array(all_patches)
+            patches_array = np.expand_dims(patches_array, axis=-1)  # Add channel dimension
+            patches_array = normalize01(patches_array)
+
+            print(f"✅ Created {patches_array.shape[0]} training patches of shape {patches_array[0].shape}")
+            return patches_array
+        except Exception as e:
+            print(f"❌ Error creating patches array: {e}")
+            # Fallback: create synthetic patches only
+            print("🔄 Creating synthetic patches as fallback...")
+            synthetic_patches = self.create_synthetic_patches(num_patches, target_patch_size)
+            patches_array = np.array(synthetic_patches)
+            patches_array = np.expand_dims(patches_array, axis=-1)
+            patches_array = normalize01(patches_array)
+            return patches_array
+        except Exception as e:
+            print(f"❌ Error creating patches array: {e}")
+            # Fallback: create synthetic patches only
+            print("🔄 Creating synthetic patches as fallback...")
+            synthetic_patches = self.create_synthetic_patches(num_patches, target_patch_size)
+            patches_array = np.array(synthetic_patches)
+            patches_array = np.expand_dims(patches_array, axis=-1)
+            patches_array = normalize01(patches_array)
+            return patches_array
+
+    def create_synthetic_patches(self, num_patches, patch_size=64):
+        """Create synthetic patches that mimic real SEM texture with consistent size"""
+        patches = []
+
+        composition = self.mineral_processor.get_sample_composition(self.sample_name)
+        five_phase_area = composition.get('five_phase_area', {})
+
+        for _ in range(num_patches):
+            # Create base texture with realistic mineral distribution
+            base = np.zeros((patch_size, patch_size))
+
+            # Add minerals based on composition
+            y, x = np.ogrid[:patch_size, :patch_size]
+
+            # Silicates (quartz, feldspar) - bright, angular
+            silicates_frac = five_phase_area.get('Silicates', 50) / 100
+            num_silicate_grains = max(1, int(silicates_frac * 15))
+            for _ in range(num_silicate_grains):
+                center_y, center_x = np.random.randint(10, patch_size-10, 2)
+                size = np.random.randint(5, 15)
+                grain = ((y - center_y)**2 + (x - center_x)**2 < size**2).astype(float)
+                base += grain * np.random.uniform(0.7, 0.9)
+
+            # Carbonates - medium gray, rounded
+            carbonate_frac = five_phase_area.get('Carbonate', 20) / 100
+            num_carbonate_grains = max(1, int(carbonate_frac * 10))
+            for _ in range(num_carbonate_grains):
+                center_y, center_x = np.random.randint(8, patch_size-8, 2)
+                size = np.random.randint(4, 12)
+                grain = ((y - center_y)**2 + (x - center_x)**2 < size**2).astype(float)
+                base += grain * np.random.uniform(0.4, 0.6)
+
+            # Clay - dark gray, fine texture
+            clay_frac = five_phase_area.get('Clay', 20) / 100
+            if clay_frac > 0:
+                clay_texture = np.random.randn(patch_size, patch_size) * 0.1 * clay_frac
+                base += clay_texture
+
+            # Kerogen - very dark, organic
+            kerogen_frac = five_phase_area.get('Kerogen', 5) / 100
+            if kerogen_frac > 0:
+                kerogen_mask = np.random.random((patch_size, patch_size)) < kerogen_frac
+                base[kerogen_mask] -= 0.3
+
+            # Add noise and normalize
+            patch = base + np.random.randn(patch_size, patch_size) * 0.05
+            patch = np.clip(patch, 0, 1)
+            patches.append(patch)
+
+        return patches
+    def find_bse_image(self):
+        """Find BSE image with tolerant names in sample root or Elements/."""
+        sample_folder = os.path.join(self.base_path, self.sample_name)
+        possible = ["bse","backscattered","sem","bse_image"]
+        dirs = [sample_folder, os.path.join(sample_folder, "Elements")]
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            for f in os.listdir(d):
+                fl = f.lower()
+                if fl.endswith((".tif",".tiff")) and any(k in fl for k in possible):
+                    return os.path.join(d, f)
+        return None
+
+def create_continuous_3d_volume(generated_patches, target_size=(192,192,192), mineral_composition=None):
+    """Create continuous watertight 3D volume from GAN output with multi-stage smoothing & hole filling."""
+    print("🔄 Creating continuous natural 3D volume...")
+    if mineral_composition is None:
+        mineral_composition = {'Silicates': 0.4, 'Clay': 0.3, 'Carbonate': 0.2, 'Kerogen': 0.05, 'Others': 0.05}
+
+    if generated_patches.ndim == 5:
+        volume = np.mean(generated_patches[...,0], axis=0)
+    else:
+        volume = generated_patches[...,0] if generated_patches.ndim == 4 else generated_patches
+
+    from scipy.ndimage import zoom, gaussian_filter, binary_fill_holes
+    zf = [target_size[i]/volume.shape[i] for i in range(3)]
+    vol = zoom(volume, zf, order=3)
+    vol = np.clip(vol, 0, 1).astype(np.float32)
+
+    # multiscale continuity enhancement
+    big   = gaussian_filter(vol, sigma=2.2)
+    mid   = gaussian_filter(vol, sigma=1.2)
+    fine  = gaussian_filter(vol, sigma=0.6)
+    weights = np.array([
+        mineral_composition.get('Silicates',0.4),
+        mineral_composition.get('Carbonate',0.2)*0.8,
+        mineral_composition.get('Clay',0.3)*0.6
+    ], dtype=np.float32)
+    weights = weights / (weights.sum() + 1e-8)
+    vol_c = (weights[0]*big + weights[1]*mid + weights[2]*fine + 0.08*vol) / (weights.sum()+0.08)
+    vol_c = np.clip(vol_c, 0, 1)
+
+    # stratification (+small correlated noise)
+    z = np.linspace(0, 2*np.pi*4, vol_c.shape[2])
+    vol_c += 0.08*np.sin(z)[None,None,:]
+    vol_c = np.clip(vol_c, 0, 1)
+
+    # robust binarization -> closed body
+    thr = float(np.quantile(vol_c, 0.55))
+    bw  = (vol_c >= thr).astype(np.uint8)
+
+    from skimage.morphology import ball, binary_closing, binary_opening, remove_small_objects
+    bw = binary_closing(bw, ball(2))
+    bw = binary_opening(bw,  ball(1))
+    bw = remove_small_objects(bw.astype(bool), min_size=500).astype(np.uint8)
+
+    # keep largest component
+    from skimage.measure import label
+    L = label(bw)
+    if L.max() > 0:
+        counts = np.bincount(L.ravel())
+        largest = counts[1:].argmax()+1
+        bw = (L == largest).astype(np.uint8)
+
+    # fill internal voids (watertight)
+    bw = binary_fill_holes(bw.astype(bool)).astype(np.uint8)
+
+    # blend back grayscale to get a continuous scalar field (for mechanical thresholds, if needed)
+    vol_final = vol_c*0.6 + (bw*1.0)*0.4
+    vol_final = np.clip(vol_final, 0, 1).astype(np.float32)
+    print(f"✅ Continuous 3D volume created: {vol_final.shape}")
+    return vol_final
+
+def export_hex_voxel_inp(volume, out_path, voxel_step=3, threshold=0.5, material=None):
+    """
+    Export a compact, IMPORTABLE Abaqus .inp with C3D8 hexes on a coarsened voxel grid.
+    Keeps file size small (<~5 MB typical for ~70-120k hexes).
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    V = (volume >= threshold).astype(np.uint8)
+    sx, sy, sz = V.shape
+
+    # coarsen so elements ~voxel_step^3
+    xs = range(0, sx-voxel_step, voxel_step)
+    ys = range(0, sy-voxel_step, voxel_step)
+    zs = range(0, sz-voxel_step, voxel_step)
+
+    # map grid nodes
+    # Create unique nodes at grid corners spaced by voxel_step
+    nx = len(range(0, sx, voxel_step)) + 1
+    ny = len(range(0, sy, voxel_step)) + 1
+    nz = len(range(0, sz, voxel_step)) + 1
+
+    # scale to ~10x10x10 mm cube
+    Sx, Sy, Sz = 10.0, 10.0, 10.0
+    def node_id(i,j,k): return 1 + (k*ny*nx) + (j*nx) + i
+
+    # elements list
+    elements = []
+    for i, x0 in enumerate(range(0, sx-voxel_step, voxel_step)):
+        for j, y0 in enumerate(range(0, sy-voxel_step, voxel_step)):
+            for k, z0 in enumerate(range(0, sz-voxel_step, voxel_step)):
+                block = V[x0:x0+voxel_step, y0:y0+voxel_step, z0:z0+voxel_step]
+                if block.mean() < 0.5:
+                    continue
+                # corners (i,j,k) at coarsened grid
+                n000 = node_id(i,   j,   k)
+                n100 = node_id(i+1, j,   k)
+                n110 = node_id(i+1, j+1, k)
+                n010 = node_id(i,   j+1, k)
+                n001 = node_id(i,   j,   k+1)
+                n101 = node_id(i+1, j,   k+1)
+                n111 = node_id(i+1, j+1, k+1)
+                n011 = node_id(i,   j+1, k+1)
+                elements.append((n000,n100,n110,n010,n001,n101,n111,n011))
+
+    if not elements:
+        raise RuntimeError("No elements selected above threshold; export aborted.")
+
+    with open(out_path, 'w') as f:
+        f.write("*HEADING\n")
+        f.write("Shale voxelized solid (C3D8) from SEM-guided GAN volume\n")
+        f.write("*PREPRINT, ECHO=NO, MODEL=NO, HISTORY=NO, CONTACT=NO\n")
+        f.write("*PART, NAME=SHALE\n")
+        f.write("*NODE\n")
+        # write nodes on coarsened grid
+        node_counter = 0
+        for k, z in enumerate(np.linspace(0, Sz, nz)):
+            for j, y in enumerate(np.linspace(0, Sy, ny)):
+                for i, x in enumerate(np.linspace(0, Sx, nx)):
+                    node_counter += 1
+                    f.write(f"{node_counter}, {x:.6f}, {y:.6f}, {z:.6f}\n")
+        f.write("*ELEMENT, TYPE=C3D8, ELSET=EALL\n")
+        for eid, e in enumerate(elements, start=1):
+            f.write(f"{eid}, {e[0]}, {e[1]}, {e[2]}, {e[3]}, {e[4]}, {e[5]}, {e[6]}, {e[7]}\n")
+        f.write("*NSET, NSET=NSURF_BOTTOM, GENERATE\n")
+        f.write(f"1, {nx*ny}, 1\n")
+        f.write("*ELSET, ELSET=EALL\n")
+        f.write("1, %d\n" % len(elements))
+        if material is None:
+            material = {"E": 25.0, "nu": 0.25, "rho": 2.65e-9}  # default
+        f.write("*MATERIAL, NAME=SHALE_MAT\n")
+        f.write("*ELASTIC\n")
+        f.write(f"{material['E']:.6f}, {material['nu']:.6f}\n")
+        f.write("*DENSITY\n")
+        f.write(f"{material['rho']:.6e}\n")
+        f.write("*SOLID SECTION, MATERIAL=SHALE_MAT, ELSET=EALL\n")
+        f.write("*END PART\n")
+        f.write("*ASSEMBLY, NAME=ASM\n")
+        f.write("*INSTANCE, NAME=SHALE-1, PART=SHALE\n")
+        f.write("*END INSTANCE\n")
+        f.write("*END ASSEMBLY\n")
+        f.write("*STEP, NAME=STATIC, NLGEOM=NO\n")
+        f.write("*STATIC\n")
+        f.write("1., 1., 1e-05, 1.\n")
+        f.write("** BC: Fix bottom Z surface\n")
+        f.write("*BOUNDARY\n")
+        f.write("SHALE-1.NSURF_BOTTOM, 1, 3, 0.\n")
+        f.write("*OUTPUT, FIELD, VARIABLE=PRESELECT\n")
+        f.write("*END STEP\n")
+    print(f"✅ Abaqus .inp exported: {out_path}")
+    return out_path
+
+def export_visuals(volume, vis_dir, prefix="result"):
+    os.makedirs(vis_dir, exist_ok=True)
+    # Save orthogonal slices
+    zmid = volume.shape[2]//2
+    ymid = volume.shape[1]//2
+    xmid = volume.shape[0]//2
+    plt.figure(); plt.imshow(volume[:,:,zmid], cmap='gray'); plt.axis('off'); plt.tight_layout()
+    plt.savefig(os.path.join(vis_dir, f"{prefix}_xy_mid.png"), dpi=200, bbox_inches='tight'); plt.close()
+    plt.figure(); plt.imshow(volume[:,ymid,:], cmap='gray'); plt.axis('off'); plt.tight_layout()
+    plt.savefig(os.path.join(vis_dir, f"{prefix}_xz_mid.png"), dpi=200, bbox_inches='tight'); plt.close()
+    plt.figure(); plt.imshow(volume[xmid,:,:], cmap='gray'); plt.axis('off'); plt.tight_layout()
+    plt.savefig(os.path.join(vis_dir, f"{prefix}_yz_mid.png"), dpi=200, bbox_inches='tight'); plt.close()
+    # Make montage of several z-slices
+    zs = np.linspace(0, volume.shape[2]-1, 16).astype(int)
+    tiles = [volume[:,:,zi] for zi in zs]
+    save_png_grid(np.stack(tiles), grid=(4,4), tile_size=128,
+                  out_path=os.path.join(vis_dir, f"{prefix}_z_grid.png"))
+
+def enhance_volume_continuity(volume, mineral_composition):
+    """Enhance 3D volume continuity based on mineral composition"""
+    print("🔄 Enhancing 3D volume continuity...")
+
+    from scipy.ndimage import gaussian_filter, zoom
+    from skimage.morphology import binary_dilation, binary_erosion, ball
+
+    # Get phase distribution from mineral composition
+    silicate_frac = mineral_composition.get('Silicates', 0.4)
+    clay_frac = mineral_composition.get('Clay', 0.3)
+    carbonate_frac = mineral_composition.get('Carbonate', 0.2)
+
+    # Multi-scale smoothing for natural continuity
+    # Large-scale smoothing for overall structure
+    large_smooth = gaussian_filter(volume, sigma=2.0)
+
+    # Medium-scale smoothing for meso-features
+    medium_smooth = gaussian_filter(volume, sigma=1.0)
+
+    # Small-scale details preservation
+    small_smooth = gaussian_filter(volume, sigma=0.5)
+
+    # Combine scales based on mineral composition
+    # Silicates form larger continuous regions
+    silicate_weight = silicate_frac
+    # Clay forms finer, more distributed patterns
+    clay_weight = clay_frac * 0.7
+    # Carbonate forms intermediate features
+    carbonate_weight = carbonate_frac * 0.5
+
+    total_weight = silicate_weight + clay_weight + carbonate_weight + 0.1
+
+    # Weighted combination
+    enhanced_volume = (
+        silicate_weight * large_smooth +
+        carbonate_weight * medium_smooth +
+        clay_weight * small_smooth +
+        0.1 * volume  # Preserve some original details
+    ) / total_weight
+
+    # Ensure volume bounds
+    enhanced_volume = np.clip(enhanced_volume, 0, 1)
+
+    # Add geological stratification effect
+    z_coords = np.linspace(0, 1, enhanced_volume.shape[2])
+    stratification = 0.1 * np.sin(z_coords * 8 * np.pi).reshape(1, 1, -1)
+    enhanced_volume = np.clip(enhanced_volume + stratification, 0, 1)
+
+    print("✅ Volume continuity enhanced")
+    return enhanced_volume
+
+def calculate_mechanical_properties(volume, mineral_processor, sample_name):
+    """Calculate mechanical properties based on mineral composition"""
+    print("📊 Calculating mechanical properties...")
+
+    composition = mineral_processor.get_sample_composition(sample_name)
+    five_phase_area = composition.get('five_phase_area', {})
+
+    # Calculate volume fractions from generated volume
+    thresholds = np.percentile(volume, [20, 40, 60, 80])
+    phase_volumes = np.zeros(5)
+
+    phase_volumes[0] = np.sum(volume >= thresholds[3])  # Silicates
+    phase_volumes[1] = np.sum((volume >= thresholds[2]) & (volume < thresholds[3]))  # Carbonate
+    phase_volumes[2] = np.sum((volume >= thresholds[1]) & (volume < thresholds[2]))  # Clay
+    phase_volumes[3] = np.sum((volume >= thresholds[0]) & (volume < thresholds[1]))  # Kerogen
+    phase_volumes[4] = np.sum(volume < thresholds[0])  # Others
+
+    phase_fractions = phase_volumes / np.sum(phase_volumes)
+
+    # Calculate equivalent properties using rule of mixtures
+    equivalent_modulus = 0
+    equivalent_density = 0
+
+    phase_mapping = ['Silicates', 'Carbonate', 'Clay', 'Kerogen', 'Others']
+    for i, phase in enumerate(phase_mapping):
+        fraction = phase_fractions[i]
+        modulus = mineral_processor.get_phase_modulus(phase)
+        density = mineral_processor.get_phase_density(phase)
+
+        equivalent_modulus += fraction * modulus
+        equivalent_density += fraction * density
+
+    properties = {
+        'equivalent_youngs_modulus': equivalent_modulus,
+        'equivalent_density': equivalent_density,
+        'phase_fractions': dict(zip(phase_mapping, phase_fractions)),
+        'sample_density': composition.get('properties', {}).get('Sample Density', 2.7),
+        'hardness': composition.get('properties', {}).get('Hardness', 5.5)
+    }
+
+    return properties
+# -------------------------
+# Configuration Classes
+# -------------------------
+
+@dataclass
+class TrainingConfig:
+    batch_size: int = 32
+    learning_rate: float = 0.001
+    epochs: int = 100
+    patch_size: int = 64
+    use_mixed_precision: bool = True
+    early_stopping_patience: int = 10
+    validation_interval: int = 5
+
+@dataclass
+class ModelConfig:
+    unet_channels: list = None
+    gan_latent_dim: int = 100
+    slicegan_dimensions: tuple = (64, 64, 64)
+
+    def __post_init__(self):
+        if self.unet_channels is None:
+            self.unet_channels = [64, 128, 256, 512]
+
+# -------------------------
+# Advanced Mineral Processor
+# -------------------------
+
+class AdvancedMineralProcessor:
+    """Advanced mineral composition processor with exact paper methodology"""
+
+    def __init__(self, excel_path):
+        # Make sure the path is absolute
+        if not os.path.isabs(excel_path):
+            excel_path = os.path.join(os.path.expanduser("~"), "Desktop", "Files", excel_path)
+        self.excel_path = excel_path
+        self.mineral_data = {}
+
+        self.sample_mapping = {
+            'sample1': 'Sample 10555\\10555',
+            'sample2': 'Sample 11203\\11203',
+            'sample3': 'Sample 11206\\11206',
+            'sample4': 'Sample 12162\\12162',
+            'sample5': 'Sample 17699\\17699',
+            'sample6': 'Sample 19472\\19472',
+            'sample7': 'Sample 21298\\21298',
+            'sample8': 'Sample 23285\\23285'
+        }
+        self.five_phase_model = {
+            'Silicates': ['Quartz', 'Alkali Feldspar', 'Plagioclase'],
+            'Carbonate': ['Calcite', 'Dolomite', 'Ankerite', 'Siderite'],
+            'Clay': ['Illite', 'Chlorite', 'Kaolinite', 'Muscovite', 'Biotite'],
+            'Kerogen': [],
+            'Others': ['Pyrite', 'Zircon', 'Rutile', 'Ilmenite', 'Apatite', 'Monazite', 'Unclassified']
+        }
+
+        self.youngs_modulus = {
+            'Silicates': 89.6,
+            'Carbonate': 74.6,
+            'Clay': 22.3,
+            'Kerogen': 9.2,
+            'Others': 12.392
+        }
+
+        self.density_values = {
+            'Silicates': 2.65,
+            'Carbonate': 2.71,
+            'Clay': 2.60,
+            'Kerogen': 1.30,
+            'Others': 3.50
+        }
+
+    def load_and_parse_excel(self):
+        print("📊 Loading and parsing Excel data...")
+        try:
+            df = pd.read_excel(self.excel_path, sheet_name='Mineral quant_all samples', header=None)
+            print(f"📐 Excel shape: {df.shape}")
+            self.process_single_sheet_data(df)
+            print("✅ Excel data loaded and parsed successfully")
+        except Exception as e:
+            print(f"❌ Error loading Excel: {e}")
+            print("🔄 Creating realistic compositions based on paper...")
+            self.create_realistic_compositions()
+
+    def process_single_sheet_data(self, df):
+        print("📊 Processing single sheet Excel data...")
+        area_start = self.find_data_start(df, 'MODAL AREA%')
+        wt_start = self.find_data_start(df, 'MODAL WT%')
+        assay_start = self.find_data_start(df, 'ASSAY')
+        properties_start = self.find_data_start(df, 'PROPERTIES')
+
+        for sample_key, excel_key in self.sample_mapping.items():
+            sample_data = {
+                'five_phase_area': {},
+                'five_phase_wt': {},
+                'assay': {},
+                'properties': {},
+                'detailed_area': {},
+                'detailed_wt': {}
+            }
+
+            if area_start >= 0:
+                self.extract_mineral_data(df, area_start, self.find_sample_column(df, excel_key, area_start),
+                                          sample_data['detailed_area'], sample_data['five_phase_area'])
+            if wt_start >= 0:
+                self.extract_mineral_data(df, wt_start, self.find_sample_column(df, excel_key, wt_start),
+                                          sample_data['detailed_wt'], sample_data['five_phase_wt'])
+
+            carbon_content = sample_data['assay'].get('C', 0)
+            kerogen_content = carbon_content * 1.2
+            sample_data['five_phase_area']['Kerogen'] = kerogen_content
+            sample_data['five_phase_wt']['Kerogen'] = kerogen_content
+            self.normalize_compositions(sample_data)
+            self.mineral_data[sample_key] = sample_data
+            print(f"✅ Processed {sample_key}: {sample_data['five_phase_area']}")
+
+    def find_data_start(self, df, keyword='MODAL AREA%'):
+        """Find the exact starting row for each data section"""
+        for idx, row in df.iterrows():
+            for cell in row:
+                if isinstance(cell, str) and keyword.lower() in cell.lower():
+                    # Return the row after the header (where data actually starts)
+                    return idx + 2  # +2 to skip the header and column names
+        return 0
+
+    def find_sample_column(self, df, excel_key, data_start):
+        header_row = data_start - 1 if data_start > 0 else 0
+        for col_idx in range(len(df.columns)):
+            cell_value = df.iloc[header_row, col_idx]
+            if isinstance(cell_value, str) and excel_key in cell_value:
+                return col_idx
+        return -1
+
+    def extract_mineral_data(self, df, start_row, col_idx, detailed_dict, five_phase_dict):
+        mineral_rows = {}
+
+        # Find the actual data rows (skip headers)
+        current_row = start_row + 1  # Skip the header row
+        while current_row < len(df):
+            mineral_name = df.iloc[current_row, 0]
+            if not isinstance(mineral_name, str) or not mineral_name.strip():
+                current_row += 1
+                continue
+
+            # Stop when we hit the next section
+            if 'MODAL' in mineral_name or 'ASSAY' in mineral_name or 'PROPERTIES' in mineral_name:
+                break
+
+            try:
+                value = float(df.iloc[current_row, col_idx])
+                detailed_dict[mineral_name] = value
+                mineral_rows[mineral_name] = value
+            except (ValueError, TypeError):
+                pass
+
+            current_row += 1
+
+        # Initialize all phases to zero
+        for phase in self.five_phase_model:
+            five_phase_dict[phase] = 0.0
+
+        # Sum up minerals for each phase
+        for phase, minerals in self.five_phase_model.items():
+            phase_total = 0
+            for mineral in minerals:
+                for detailed_mineral, value in mineral_rows.items():
+                    if mineral.lower() in detailed_mineral.lower():
+                        phase_total += value
+                        break  # Only count each mineral once
+            five_phase_dict[phase] = phase_total
+
+        # Special handling for Kerogen from carbon content
+        # Find carbon content in assay section
+        carbon_content = 0
+        assay_start = self.find_data_start(df, 'ASSAY')
+        if assay_start >= 0:
+            current_row = assay_start + 1
+            while current_row < len(df):
+                element_name = df.iloc[current_row, 0]
+                if isinstance(element_name, str) and 'C' in element_name and len(element_name.strip()) <= 3:
+                    try:
+                        carbon_content = float(df.iloc[current_row, col_idx])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+                current_row += 1
+
+        # Convert carbon to kerogen (approximate conversion)
+        kerogen_content = carbon_content * 1.2
+        five_phase_dict['Kerogen'] = kerogen_content
+    def normalize_compositions(self, sample_data):
+        for comp_type in ['five_phase_area', 'five_phase_wt']:
+            total = sum(sample_data[comp_type].values())
+            if total > 0:
+                for phase in sample_data[comp_type]:
+                    sample_data[comp_type][phase] = (sample_data[comp_type][phase] / total) * 100
+
+    def create_realistic_compositions(self):
+        print("🔄 Creating realistic compositions based on paper...")
+        realistic_data = {
+            'sample1': {'Silicates': 45.2, 'Carbonate': 25.1, 'Clay': 18.3, 'Kerogen': 6.4, 'Others': 5.0},
+            'sample2': {'Silicates': 52.7, 'Carbonate': 18.9, 'Clay': 22.1, 'Kerogen': 3.8, 'Others': 2.5},
+            'sample3': {'Silicates': 38.4, 'Carbonate': 32.6, 'Clay': 15.8, 'Kerogen': 8.2, 'Others': 5.0},
+            'sample4': {'Silicates': 61.3, 'Carbonate': 12.4, 'Clay': 19.6, 'Kerogen': 4.2, 'Others': 2.5},
+            'sample5': {'Silicates': 42.8, 'Carbonate': 28.3, 'Clay': 16.9, 'Kerogen': 7.5, 'Others': 4.5},
+            'sample6': {'Silicates': 55.1, 'Carbonate': 15.7, 'Clay': 21.3, 'Kerogen': 5.4, 'Others': 2.5},
+            'sample7': {'Silicates': 47.9, 'Carbonate': 22.8, 'Clay': 17.6, 'Kerogen': 6.9, 'Others': 4.8},
+            'sample8': {'Silicates': 58.6, 'Carbonate': 14.2, 'Clay': 20.1, 'Kerogen': 4.6, 'Others': 2.5}
+        }
+        for sample_key in self.sample_mapping.keys():
+            composition = realistic_data.get(sample_key, realistic_data['sample1'])
+            self.mineral_data[sample_key] = {
+                'five_phase_area': composition,
+                'five_phase_wt': composition,
+                'assay': {'C': composition['Kerogen'] / 1.2},
+                'properties': {'Sample Density': 2.70, 'Hardness': 5.5},
+                'detailed_area': composition,
+                'detailed_wt': composition
+            }
+
+    def get_sample_composition(self, sample_name):
+        return self.mineral_data.get(sample_name, {})
+
+    def get_phase_modulus(self, phase):
+        return self.youngs_modulus.get(phase, 12.392)
+
+    def get_phase_density(self, phase):
+        return self.density_values.get(phase, 2.70)
+
+# -------------------------
+# TensorFlow Model Classes
+# -------------------------
+
+class ResidualAttentionUNet:
+    """Advanced Residual Attention U-Net for semantic segmentation"""
+
+    def __init__(self, input_size=(64, 64, 1), num_classes=5):
+        self.input_size = input_size
+        self.num_classes = num_classes
+        self.model = self.build_model()
+
+    def residual_block(self, x, filters, kernel_size=3, stride=1):
+        shortcut = x
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        x = Conv2D(filters, kernel_size, strides=stride, padding='same')(x)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        x = Conv2D(filters, kernel_size, strides=1, padding='same')(x)
+        if shortcut.shape[-1] != filters or stride != 1:
+            shortcut = Conv2D(filters, 1, strides=stride, padding='same')(shortcut)
+        x = Add()([x, shortcut])
+        return x
+
+    def attention_block(self, x, g, filters):
+        theta_x = Conv2D(filters, 1, strides=1, padding='same')(x)
+        phi_g   = Conv2D(filters, 1, strides=1, padding='same')(g)
+        add     = Add()([theta_x, phi_g])
+        relu    = ReLU()(add)
+        psi     = Conv2D(1, 1, strides=1, padding='same')(relu)
+        sigmoid = Activation('sigmoid')(psi)
+        return Multiply()([x, sigmoid])
+
+    def build_model(self):
+        inputs = Input(self.input_size)
+
+        # Encoder
+        e1 = self.residual_block(inputs, 32)
+        p1 = MaxPooling2D(2)(e1)
+        e2 = self.residual_block(p1, 64)
+        p2 = MaxPooling2D(2)(e2)
+        e3 = self.residual_block(p2, 128)
+        p3 = MaxPooling2D(2)(e3)
+        b  = self.residual_block(p3, 256)
+
+        # Decoder with attention
+        d3 = Conv2DTranspose(128, 2, strides=2, padding='same')(b)
+        a3 = self.attention_block(e3, d3, 128)
+        d3 = Concatenate()([d3, a3])
+        d3 = self.residual_block(d3, 128)
+
+        d2 = Conv2DTranspose(64, 2, strides=2, padding='same')(d3)
+        a2 = self.attention_block(e2, d2, 64)
+        d2 = Concatenate()([d2, a2])
+        d2 = self.residual_block(d2, 64)
+
+        d1 = Conv2DTranspose(32, 2, strides=2, padding='same')(d2)
+        a1 = self.attention_block(e1, d1, 32)
+        d1 = Concatenate()([d1, a1])
+        d1 = self.residual_block(d1, 32)
+
+        outputs = Conv2D(self.num_classes, 1, activation='softmax', dtype='float32')(d1)
+
+        model = Model(inputs, outputs, name='ResidualAttentionUNet')
+        model.compile(optimizer=Adam(learning_rate=1e-4),
+                     loss='categorical_crossentropy',
+                     metrics=['accuracy'])
+        print("✅ Residual Attention U-Net built successfully")
+        return model
+
+class DCGAN_Generator:
+    def __init__(self, latent_dim=100, channels=1):
+        self.latent_dim = latent_dim
+        self.channels = channels
+        self.model = self.build_model()
+
+    def build_model(self):
+        model = Sequential(name='DCGAN_Generator')
+        model.add(Dense(4*4*512, input_dim=self.latent_dim))
+        model.add(Reshape((4, 4, 512)))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        model.add(Conv2DTranspose(256, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        model.add(Conv2DTranspose(128, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        model.add(Conv2DTranspose(64, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        model.add(Conv2DTranspose(self.channels, 4, strides=2, padding='same', activation='tanh'))
+        return model
+
+class DCGAN_Discriminator:
+    def __init__(self, channels=1):
+        self.channels = channels
+        self.model = self.build_model()
+
+    def build_model(self):
+        model = Sequential(name='DCGAN_Discriminator')
+        model.add(Input(shape=(64, 64, self.channels)))  # Use Input layer instead of input_shape
+        model.add(Conv2D(64, 4, strides=2, padding='same'))
+        model.add(LeakyReLU(0.2))
+
+        model.add(Conv2D(128, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(LeakyReLU(0.2))
+
+        model.add(Conv2D(256, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(LeakyReLU(0.2))
+
+        model.add(Conv2D(512, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(LeakyReLU(0.2))
+
+        model.add(Flatten())
+        model.add(Dense(1, activation='sigmoid'))
+        return model
+
+class AdvancedSliceGAN3D:
+    """Memory-optimized 3D SliceGAN with geological realism"""
+
+    def __init__(self, latent_dim=128, volume_size=64):
+        self.latent_dim = latent_dim
+        self.volume_size = volume_size
+        self.generator = self.build_memory_efficient_generator()
+        self.discriminators = self.build_lightweight_discriminators()
+        print("🤖 Memory-optimized SliceGAN 3D Initialized")
+
+    def build_memory_efficient_generator(self):
+        """Memory-efficient generator matching paper specifications"""
+        model = Sequential(name='MemoryEfficientGenerator')
+        model.add(Dense(4*4*4*512, input_dim=self.latent_dim))
+        model.add(Reshape((4, 4, 4, 512)))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        # Layer 1: 4x4x4 -> 8x8x8
+        model.add(Conv3DTranspose(256, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        # Layer 2: 8x8x8 -> 16x16x16
+        model.add(Conv3DTranspose(128, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        # Layer 3: 16x16x16 -> 32x32x32
+        model.add(Conv3DTranspose(64, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        # Layer 4: 32x32x32 -> 64x64x64
+        model.add(Conv3DTranspose(32, 4, strides=2, padding='same'))
+        model.add(BatchNormalization())
+        model.add(ReLU())
+
+        # Final layer
+        model.add(Conv3DTranspose(1, 3, padding='same', activation='tanh'))
+        return model
+
+    def build_lightweight_discriminators(self):
+        """Enhanced discriminators matching paper architecture"""
+        def build_discriminator(name_suffix):
+            model = Sequential(name=f'Discriminator_{name_suffix}')
+            model.add(Input(shape=(self.volume_size, self.volume_size, 1)))  # Use Input layer
+            model.add(Conv2D(64, 4, strides=2, padding='same'))
+            model.add(LeakyReLU(0.2))
+
+            model.add(Conv2D(128, 4, strides=2, padding='same'))
+            model.add(BatchNormalization())
+            model.add(LeakyReLU(0.2))
+
+            model.add(Conv2D(256, 4, strides=2, padding='same'))
+            model.add(BatchNormalization())
+            model.add(LeakyReLU(0.2))
+
+            model.add(Conv2D(512, 4, strides=2, padding='same'))
+            model.add(BatchNormalization())
+            model.add(LeakyReLU(0.2))
+
+            model.add(Flatten())
+            model.add(Dense(1, activation='sigmoid'))
+
+            model.compile(
+                optimizer=Adam(learning_rate=0.0002, beta_1=0.5),
+                loss='binary_crossentropy'
+            )
+            return model
+
+        return {
+            'xy': build_discriminator('XY'),
+            'xz': build_discriminator('XZ'),
+            'yz': build_discriminator('YZ')
+        }
+
+# -------------------------
+# GPU-Optimized Training Functions
+# -------------------------
+
+def create_realistic_sem_data(sample_name, base_path, num_samples=1000, patch_size=64):
+    """Create realistic SEM training data from actual images with consistent patch size"""
+    print(f"🎨 Creating realistic SEM data for {sample_name}")
+
+    data_generator = RealisticSEMDataGenerator(base_path, sample_name)
+    patches = data_generator.create_training_patches(num_samples, patch_size)
+    # Save training patches to Training_Data and a preview grid
+    dirs = ensure_project_dirs(base_path)
+    np.savez_compressed(os.path.join(dirs["Training_Data"], f"{sample_name}_patches.npz"), patches=patches)
+    try:
+        save_png_grid(np.squeeze(patches), grid=(10,10), tile_size=patch_size,
+                      out_path=os.path.join(dirs["Visualisations"], f"{sample_name}_patch_grid.png"))
+    except Exception as _:
+        pass
+    return patches
+
+def create_synthetic_labels(patches, num_classes=5):
+    """Create synthetic labels for U-Net training"""
+    print("🏷️ Creating synthetic labels...")
+
+    labels = np.zeros((patches.shape[0], patches.shape[1], patches.shape[2]), dtype=np.int32)
+    for i, patch in enumerate(patches):
+        patch_flat = patch.flatten()
+        thresholds = np.percentile(patch_flat, [20, 40, 60, 80])
+
+        labels[i][patch < thresholds[0]] = 4
+        labels[i][(patch >= thresholds[0]) & (patch < thresholds[1])] = 3
+        labels[i][(patch >= thresholds[1]) & (patch < thresholds[2])] = 2
+        labels[i][(patch >= thresholds[2]) & (patch < thresholds[3])] = 1
+        labels[i][patch >= thresholds[3]] = 0
+
+    return tf.keras.utils.to_categorical(labels, num_classes)
+
+def train_unet_gpu(model, patches, epochs=50, batch_size=32):
+    """GPU-optimized U-Net training"""
+    print(f"🚀 Training U-Net on GPU: {epochs} epochs")
+
+    # Create synthetic data
+    patches_gray = np.squeeze(patches) if patches.shape[-1] == 1 else np.mean(patches, axis=-1)
+    labels_categorical = create_synthetic_labels(patches_gray)
+    patches_expanded = np.expand_dims(patches_gray, axis=-1) if patches_gray.ndim == 3 else patches
+
+    print(f"📊 Training data: {patches_expanded.shape[0]} patches, shape: {patches_expanded[0].shape}")
+    print(f"📊 Labels shape: {labels_categorical.shape}")
+
+    # Use tf.data for optimal GPU utilization with proper dataset sizing
+    dataset = tf.data.Dataset.from_tensor_slices((patches_expanded, labels_categorical))
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = dataset.cache()
+    dataset = dataset.repeat()  # Add repeat to avoid running out of data
+
+    # Calculate steps per epoch
+    steps_per_epoch = max(1, len(patches_expanded) // batch_size)
+    print(f"📈 Steps per epoch: {steps_per_epoch}")
+
+    # Custom callback to show progress every epoch
+    class EpochProgressCallback(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            loss = logs.get('loss', 0)
+            accuracy = logs.get('accuracy', 0)
+            print(f'🎯 U-Net Epoch {epoch+1}/{epochs} | Loss: {loss:.4f} | Accuracy: {accuracy:.4f}')
+
+    # Training callbacks
+    callbacks = [
+        EpochProgressCallback(),
+        ReduceLROnPlateau(monitor='loss', factor=0.5, patience=5, min_lr=1e-6),
+    ]
+
+    print("🎯 Starting U-Net training...")
+    history = model.fit(
+        dataset,
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        callbacks=callbacks,
+        verbose=0  # Set to 0 to use our custom callback
+    )
+
+    print("✅ U-Net training completed")
+    return history
+
+def train_dcgan_gpu(generator, discriminator, real_images, epochs=200, batch_size=32):
+    """GPU-optimized DCGAN training"""
+    print(f"🚀 Training DCGAN on GPU: {epochs} epochs")
+
+    # Compile models
+    discriminator_optimizer = Adam(learning_rate=0.0002, beta_1=0.5)
+    generator_optimizer = Adam(learning_rate=0.0002, beta_1=0.5)
+
+    cross_entropy = tf.keras.losses.BinaryCrossentropy()
+
+    @tf.function
+    def train_step(images):
+        batch_size = tf.shape(images)[0]
+        noise = tf.random.normal([batch_size, 100])
+
+        with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+            generated_images = generator(noise, training=True)
+
+            real_output = discriminator(images, training=True)
+            fake_output = discriminator(generated_images, training=True)
+
+            gen_loss = cross_entropy(tf.ones_like(fake_output), fake_output)
+            real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+            fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
+            disc_loss = real_loss + fake_loss
+
+        gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
+        gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+
+        generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
+        discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+
+        return gen_loss, disc_loss
+
+    # Prepare dataset
+    dataset = tf.data.Dataset.from_tensor_slices(real_images)
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+    for epoch in range(epochs):
+        total_gen_loss = 0
+        total_disc_loss = 0
+        num_batches = 0
+
+        for image_batch in dataset:
+            gen_loss, disc_loss = train_step(image_batch)
+            total_gen_loss += gen_loss
+            total_disc_loss += disc_loss
+            num_batches += 1
+
+        # Show progress every epoch
+        avg_gen_loss = total_gen_loss / num_batches
+        avg_disc_loss = total_disc_loss / num_batches
+        print(f'⚡ DCGAN Epoch {epoch+1}/{epochs} | G: {avg_gen_loss:.4f} | D: {avg_disc_loss:.4f}')
+
+    print("✅ DCGAN training completed")
+    return generator, discriminator
+
+def train_slicegan_3d_gpu(slicegan, real_patches, epochs=100, batch_size=4):
+    """GPU-optimized 3D SliceGAN training"""
+    print(f"🚀 Training 3D SliceGAN on GPU: {epochs} epochs")
+
+    generator = slicegan.generator
+    discriminators = slicegan.discriminators
+
+    # Optimizers
+    generator_optimizer = Adam(learning_rate=0.0002, beta_1=0.5)
+    discriminator_optimizers = {
+        name: Adam(learning_rate=0.0002, beta_1=0.5) for name in discriminators.keys()
+    }
+
+    cross_entropy = tf.keras.losses.BinaryCrossentropy()
+
+    @tf.function
+    def train_step(real_slices):
+        batch_size = tf.shape(real_slices)[0]
+        noise = tf.random.normal([batch_size, slicegan.latent_dim])
+
+        # Train discriminators
+        total_disc_loss = 0
+        with tf.GradientTape(persistent=True) as disc_tape:
+            generated_volumes = generator(noise, training=True)
+
+            for axis_name, discriminator in discriminators.items():
+                # Get slices from generated volumes
+                if axis_name == 'xy':
+                    fake_slices = generated_volumes[:, :, :, 32, :]  # Middle slice
+                elif axis_name == 'xz':
+                    fake_slices = generated_volumes[:, :, 32, :, :]  # Middle slice
+                else:  # yz
+                    fake_slices = generated_volumes[:, 32, :, :, :]  # Middle slice
+
+                real_output = discriminator(real_slices, training=True)
+                fake_output = discriminator(fake_slices, training=True)
+
+                real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+                fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
+                disc_loss = (real_loss + fake_loss) / 2
+                total_disc_loss += disc_loss
+
+                # Update discriminator
+                gradients = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+                discriminator_optimizers[axis_name].apply_gradients(
+                    zip(gradients, discriminator.trainable_variables)
+                )
+
+        # Train generator
+        with tf.GradientTape() as gen_tape:
+            generated_volumes = generator(noise, training=True)
+            gen_loss = 0
+
+            for axis_name, discriminator in discriminators.items():
+                if axis_name == 'xy':
+                    fake_slices = generated_volumes[:, :, :, 32, :]
+                elif axis_name == 'xz':
+                    fake_slices = generated_volumes[:, :, 32, :, :]
+                else:  # yz
+                    fake_slices = generated_volumes[:, 32, :, :, :]
+
+                fake_output = discriminator(fake_slices, training=False)
+                gen_loss += cross_entropy(tf.ones_like(fake_output), fake_output)
+
+            gen_loss = gen_loss / len(discriminators)
+
+        gradients = gen_tape.gradient(gen_loss, generator.trainable_variables)
+        generator_optimizer.apply_gradients(zip(gradients, generator.trainable_variables))
+
+        return gen_loss, total_disc_loss / len(discriminators)
+
+    # Prepare dataset
+    dataset = tf.data.Dataset.from_tensor_slices(real_patches)
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+    for epoch in range(epochs):
+        total_gen_loss = 0
+        total_disc_loss = 0
+        num_batches = 0
+
+        for real_batch in dataset:
+            gen_loss, disc_loss = train_step(real_batch)
+            total_gen_loss += gen_loss
+            total_disc_loss += disc_loss
+            num_batches += 1
+
+        # Show progress every epoch
+        avg_gen_loss = total_gen_loss / num_batches
+        avg_disc_loss = total_disc_loss / num_batches
+        print(f'🎯 SliceGAN Epoch {epoch+1}/{epochs} | G: {avg_gen_loss:.4f} | D: {avg_disc_loss:.4f}')
+
+    print("✅ 3D SliceGAN training completed")
+    return slicegan
+def generate_final_3d_volume(slicegan_model, mineral_processor, sample_name,
+                           num_volumes=1, save_path="output", target_size=(192,192,192)):
+    """Generate closed, continuous 3D volume and export visuals + Abaqus .inp."""
+    print(f"🎯 Generating {num_volumes} continuous 3D volume(s) for {sample_name}...")
+    os.makedirs(save_path, exist_ok=True)
+
+    # 1) Generate latent volume
+    z = tf.random.normal([num_volumes, slicegan_model.latent_dim])
+    gen = slicegan_model.generator(z, training=False).numpy()  # [N,64,64,64,1] tanh -> [-1,1]
+    gen = (gen*0.5 + 0.5).astype(np.float32)  # [0,1]
+
+    # 2) Composition
+    comp = mineral_processor.get_sample_composition(sample_name)
+    five_phase = comp.get('five_phase_area', {})
+
+    # 3) Make continuous + closed
+    vol = create_continuous_3d_volume(gen, target_size=target_size, mineral_composition=five_phase)
+
+    # 4) Mechanical properties FIRST, then export
+    properties = calculate_mechanical_properties(vol, mineral_processor, sample_name)
+    mat = {
+        "E": float(properties['equivalent_youngs_modulus']),
+        "nu": 0.25,
+        "rho": float(properties['equivalent_density']*1e-9)  # g/cm^3 -> tonne/mm^3 approx.
+    }
+
+    # 5) Save volume (TIFF + NPY + TIFF stack for CAE preview)
+    vol_name = f"3d_volume_{sample_name}"
+    tifffile.imwrite(os.path.join(save_path, f"{vol_name}.tiff"), (vol*65535).astype(np.uint16))
+    np.save(os.path.join(save_path, f"{vol_name}.npy"), vol)
+
+    # also push to shared project dirs
+    dirs = ensure_project_dirs(os.path.dirname(save_path))
+    tifffile.imwrite(os.path.join(dirs["tiff_stack"], f"{vol_name}.tiff"), (vol*65535).astype(np.uint16))
+
+    # 6) Visuals
+    export_visuals(vol, dirs["Visualisations"], prefix=vol_name)
+
+    # 7) Abaqus export (compact voxelized hex mesh)
+    inp_path = os.path.join(dirs["abaqus"], f"{vol_name}.inp")
+    # choose voxel_step to keep size <= ~5 MB; 3 or 4 are good starting points
+    export_hex_voxel_inp(vol, inp_path, voxel_step=3, threshold=float(np.quantile(vol, 0.55)), material=mat)
+
+    # 8) Save properties JSON in output
+    with open(os.path.join(save_path, f"mechanical_properties_{sample_name}.json"), 'w') as f:
+        json.dump(properties, f, indent=2, cls=NumpyEncoder)
+
+    print(f"💾 Saved continuous 3D volume + Abaqus INP for {sample_name}")
+    print(f"📊 Equivalent E = {properties['equivalent_youngs_modulus']:.2f} GPa  |  ρ ≈ {properties['equivalent_density']:.2f} g/cm³")
+    return vol, properties
+
+def calculate_equivalent_modulus(volumes, mineral_processor):
+    """Calculate equivalent modulus for generated 3D volumes"""
+    print("📊 Calculating equivalent modulus for 3D volumes...")
+
+    equivalent_moduli = []
+
+    # Define phase mapping with proper ordering
+    phase_mapping = {
+        0: 'Silicates',
+        1: 'Carbonate',
+        2: 'Clay',
+        3: 'Kerogen',
+        4: 'Others'
+    }
+
+    for i, volume in enumerate(volumes):
+        # Ensure volume is properly normalized
+        volume_norm = (volume - np.min(volume)) / (np.max(volume) - np.min(volume) + 1e-8)
+
+        # Use more distinct thresholds for better phase separation
+        thresholds = np.percentile(volume_norm, [15, 35, 65, 85])
+        phase_volume = np.zeros_like(volume_norm, dtype=np.int8)
+
+        # Assign phases with better separation
+        phase_volume[volume_norm <= thresholds[0]] = 4  # Kerogen (darkest)
+        phase_volume[(volume_norm > thresholds[0]) & (volume_norm <= thresholds[1])] = 3  # Clay
+        phase_volume[(volume_norm > thresholds[1]) & (volume_norm <= thresholds[2])] = 2  # Others
+        phase_volume[(volume_norm > thresholds[2]) & (volume_norm <= thresholds[3])] = 1  # Carbonate
+        phase_volume[volume_norm > thresholds[3]] = 0  # Silicates (brightest)
+
+        # Calculate volume fractions
+        total_voxels = volume_norm.size
+        phase_fractions = {}
+
+        for phase_id, phase_name in phase_mapping.items():
+            fraction = np.sum(phase_volume == phase_id) / total_voxels
+            phase_fractions[phase_name] = fraction
+
+        # Calculate equivalent modulus using rule of mixtures
+        equivalent_modulus = 0
+        for phase_name, fraction in phase_fractions.items():
+            phase_modulus = mineral_processor.get_phase_modulus(phase_name)
+            equivalent_modulus += fraction * phase_modulus
+
+        equivalent_moduli.append(equivalent_modulus)
+        print(f"📈 Volume {i+1}: Equivalent Modulus = {equivalent_modulus:.2f} GPa")
+        print(f"   Phase fractions: {phase_fractions}")
+
+    return np.array(equivalent_moduli)
+
+def save_training_artifacts(models, volumes, moduli, save_path="output"):
+    """Save all training artifacts and results"""
+    print(f"💾 Saving training artifacts to: {save_path}...")
+
+    os.makedirs(save_path, exist_ok=True)
+
+    # Save models
+    for name, model in models.items():
+        if name == 'unet':
+            model.model.save(os.path.join(save_path, "trained_unet.h5"))
+        elif name == 'dcgan_generator':
+            model.save(os.path.join(save_path, "trained_dcgan_generator.h5"))
+        elif name == 'slicegan':
+            model.generator.save(os.path.join(save_path, "trained_slicegan_generator.h5"))
+
+    # Save volumes and moduli
+    np.save(os.path.join(save_path, "generated_3d_volumes.npy"), volumes)
+    np.save(os.path.join(save_path, "equivalent_moduli.npy"), moduli)
+
+    # Save summary with proper error handling
+    summary = {
+        'num_volumes_generated': len(volumes) if volumes is not None else 0,
+        'volume_shape': volumes[0].shape if volumes is not None and len(volumes) > 0 else 'N/A',
+        'mean_modulus': float(np.mean(moduli)) if moduli is not None and len(moduli) > 0 else 0.0,
+        'std_modulus': float(np.std(moduli)) if moduli is not None and len(moduli) > 0 else 0.0,
+        'min_modulus': float(np.min(moduli)) if moduli is not None and len(moduli) > 0 else 0.0,
+        'max_modulus': float(np.max(moduli)) if moduli is not None and len(moduli) > 0 else 0.0
+    }
+
+    try:
+        with open(os.path.join(save_path, "training_summary.json"), 'w') as f:
+            json.dump(summary, f, indent=2, cls=NumpyEncoder)
+        print("✅ Training summary saved")
+    except Exception as e:
+        print(f"⚠️ Could not save training summary: {e}")
+
+    print(f"✅ All artifacts saved to '{save_path}'")
+    return summary
+# -------------------------
+# Main Training Pipeline
+# -------------------------
+
+class TensorFlowShaleTrainer:
+    def __init__(self, base_path, excel_filename):
+        self.base_path = base_path
+        # Ensure excel_filename is absolute path
+        if not os.path.isabs(excel_filename):
+            self.excel_filename = os.path.join(base_path, excel_filename)
+        else:
+            self.excel_filename = excel_filename
+        self.models = {}
+
+        # Check if paths exist
+        if not os.path.exists(self.base_path):
+            print(f"⚠️ Warning: Base path {self.base_path} does not exist")
+        if not os.path.exists(self.excel_filename):
+            print(f"⚠️ Warning: Excel file {self.excel_filename} does not exist")
+    def train_ultra_fast(self, sample_name, epochs_unet=20, epochs_dcgan=50, epochs_slicegan=10):
+        """ULTRA-FAST training pipeline for specific sample"""
+        print(f"🚀 STARTING ULTRA-FAST TENSORFLOW TRAINING for {sample_name}")
+        print(f"📈 Training configuration:")
+        print(f"   • U-Net: {epochs_unet} epochs")
+        print(f"   • DCGAN: {epochs_dcgan} epochs")
+        print(f"   • SliceGAN: {epochs_slicegan} epochs")
+
+        # Create realistic training data from actual SEM images
+        print("📊 Generating training data from real SEM images...")
+        patches = create_realistic_sem_data(sample_name, self.base_path, num_samples=1000, patch_size=64)
+
+        # Stage 1: Ultra-fast U-Net
+        print("\n🎯 Stage 1: Training U-Net (Ultra-Fast)")
+        unet = ResidualAttentionUNet(input_size=(64, 64, 1), num_classes=5)
+        unet_history = train_unet_gpu(unet.model, patches, epochs=epochs_unet, batch_size=32)
+        self.models['unet'] = unet
+
+        # Clear memory after U-Net training (fix the warning)
+        import tensorflow.compat.v1 as tf_v1
+        tf_v1.reset_default_graph()
+        gc.collect()
+        print("🧹 Cleared memory after U-Net training")
+
+        # Stage 2: Ultra-fast DCGAN
+        print("\n🎯 Stage 2: Training DCGAN (Ultra-Fast)")
+        generator = DCGAN_Generator()
+        discriminator = DCGAN_Discriminator()
+        trained_generator, trained_discriminator = train_dcgan_gpu(
+            generator.model, discriminator.model, patches, epochs=epochs_dcgan, batch_size=32
+        )
+        self.models['dcgan_generator'] = trained_generator
+        self.models['dcgan_discriminator'] = trained_discriminator
+
+        # Clear memory after DCGAN training (fix the warning)
+        tf_v1.reset_default_graph()
+        gc.collect()
+        print("🧹 Cleared memory after DCGAN training")
+
+        # Stage 3: Ultra-fast 3D SliceGAN
+        print("\n🎯 Stage 3: Training 3D SliceGAN (Ultra-Fast)")
+        slicegan = AdvancedSliceGAN3D(latent_dim=128, volume_size=64)
+        trained_slicegan = train_slicegan_3d_gpu(slicegan, patches, epochs=epochs_slicegan, batch_size=4)
+        self.models['slicegan'] = trained_slicegan
+
+        print(f"\n✅ ULTRA-FAST TENSORFLOW TRAINING COMPLETED for {sample_name}!")
+        print(f"🤖 Trained {len(self.models)} models")
+        return self.models
+
+    def train_full_pipeline(self, sample_name, epochs_unet=100, epochs_dcgan=200, epochs_slicegan=50):
+        """Full training pipeline with more epochs"""
+        print("🚀 STARTING FULL TENSORFLOW TRAINING PIPELINE")
+        print(f"📈 Training configuration:")
+        print(f"   • U-Net: {epochs_unet} epochs")
+        print(f"   • DCGAN: {epochs_dcgan} epochs")
+        print(f"   • SliceGAN: {epochs_slicegan} epochs")
+
+        # Create larger dataset for full training
+        patches = create_realistic_sem_data(sample_name, self.base_path, num_samples=5000, patch_size=64)
+
+        # Stage 1: U-Net
+        print("\n🎯 Stage 1: Training U-Net")
+        unet = ResidualAttentionUNet(input_size=(64, 64, 1), num_classes=5)
+        unet_history = train_unet_gpu(unet.model, patches, epochs=epochs_unet, batch_size=32)
+        self.models['unet'] = unet
+
+        # Clear memory after U-Net training
+        import tensorflow.compat.v1 as tf_v1
+        tf_v1.reset_default_graph()
+        gc.collect()
+
+        # Stage 2: DCGAN
+        print("\n🎯 Stage 2: Training DCGAN")
+        generator = DCGAN_Generator()
+        discriminator = DCGAN_Discriminator()
+        trained_generator, trained_discriminator = train_dcgan_gpu(
+            generator.model, discriminator.model, patches, epochs=epochs_dcgan, batch_size=32
+        )
+        self.models['dcgan_generator'] = trained_generator
+        self.models['dcgan_discriminator'] = trained_discriminator
+
+        # Clear memory after DCGAN training
+        tf_v1.reset_default_graph()
+        gc.collect()
+
+        # Stage 3: 3D SliceGAN
+        print("\n🎯 Stage 3: Training 3D SliceGAN")
+        slicegan = AdvancedSliceGAN3D(latent_dim=128, volume_size=64)
+        trained_slicegan = train_slicegan_3d_gpu(slicegan, patches, epochs=epochs_slicegan, batch_size=8)
+        self.models['slicegan'] = trained_slicegan
+
+        print(f"\n✅ FULL TENSORFLOW TRAINING PIPELINE COMPLETED!")
+        return self.models
+# -------------------------
+# Visualization and Results
+# -------------------------
+
+def visualize_results(models, output_path="output"):
+    """Visualize training results and generated samples"""
+    print("\n📊 VISUALIZING RESULTS...")
+
+    # Ensure output directory exists
+    os.makedirs(output_path, exist_ok=True)
+
+    # Generate and display samples
+    if 'dcgan_generator' in models:
+        print("🎨 Generating DCGAN samples...")
+        # Generate sample images
+        noise = tf.random.normal([16, 100])
+        generated_images = models['dcgan_generator'](noise)
+
+        # Plot generated images
+        plt.figure(figsize=(10, 10))
+        for i in range(16):
+            plt.subplot(4, 4, i + 1)
+            plt.imshow(generated_images[i, :, :, 0], cmap='gray')
+            plt.axis('off')
+        plt.suptitle('DCGAN Generated SEM Images')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_path, 'dcgan_generated_images.png'), dpi=300, bbox_inches='tight')
+        plt.show()
+
+    if 'slicegan' in models:
+        print("🎨 Generating 3D SliceGAN samples...")
+        # Generate sample volume
+        noise = tf.random.normal([1, 128])
+        generated_volume = models['slicegan'].generator(noise)
+
+        # Display slices from the generated volume
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+        slices = [0, 16, 32, 48, 63]  # Different depth slices
+
+        for i, slice_idx in enumerate(slices[:3]):
+            # XY slice
+            axes[0, i].imshow(generated_volume[0, :, :, slice_idx, 0], cmap='viridis')
+            axes[0, i].set_title(f'XY Slice z={slice_idx}')
+            axes[0, i].axis('off')
+
+        for i, slice_idx in enumerate(slices[2:5]):
+            # XZ slice
+            axes[1, i].imshow(generated_volume[0, :, slice_idx, :, 0], cmap='viridis')
+            axes[1, i].set_title(f'XZ Slice y={slice_idx}')
+            axes[1, i].axis('off')
+
+        plt.suptitle('3D SliceGAN Generated Volume Slices')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_path, 'slicegan_generated_volume.png'), dpi=300, bbox_inches='tight')
+        plt.show()
+
+        # Save 3D volume as TIFF stack
+        volume_np = generated_volume.numpy()[0, :, :, :, 0]
+        volume_np = (np.clip(volume_np*0.5+0.5, 0, 1)*65535).astype(np.uint16)  # scale to 16-bit
+        tifffile.imwrite(os.path.join(output_path, 'generated_3d_volume.tiff'), volume_np)
+        print(f"💾 Saved 3D volume as '{os.path.join(output_path, 'generated_3d_volume.tiff')}'")
+def export_abaqus_input(volume, properties, output_path="abaqus_model.inp"):
+    """Export Abaqus input file for the generated 3D model"""
+    print("📤 Exporting Abaqus input file...")
+
+    # Create simple Abaqus input file
+    with open(output_path, 'w') as f:
+        f.write("*HEADING\n")
+        f.write(f"3D Shale Model - Equivalent Young's Modulus: {properties['equivalent_youngs_modulus']:.2f} GPa\n")
+        f.write("**\n")
+        f.write("*PREPRINT, ECHO=NO, MODEL=NO, HISTORY=NO, CONTACT=NO\n")
+        f.write("**\n")
+        f.write("** PARTS\n")
+        f.write("**\n")
+        f.write("*PART, NAME=SHALE_MODEL\n")
+        f.write("**\n")
+        f.write("** MATERIALS\n")
+        f.write("**\n")
+        f.write("*MATERIAL, NAME=SHALE_MATERIAL\n")
+        f.write("*ELASTIC\n")
+        f.write(f"{properties['equivalent_youngs_modulus']:.2f}, 0.3\n")
+        f.write("*DENSITY\n")
+        f.write(f"{properties['equivalent_density']:.2f}\n")
+        f.write("**\n")
+        f.write("** END OF DATA\n")
+
+    print(f"✅ Abaqus input file saved: {output_path}")
+def save_models(models):
+    """Save trained models"""
+    print("\n💾 SAVING MODELS...")
+
+    for name, model in models.items():
+        if name == 'unet':
+            model.model.save('trained_unet_model.h5')
+            print(f"✅ Saved U-Net as 'trained_unet_model.h5'")
+        elif name == 'dcgan_generator':
+            model.save('trained_dcgan_generator.h5')
+            print(f"✅ Saved DCGAN Generator as 'trained_dcgan_generator.h5'")
+        elif name == 'dcgan_discriminator':
+            model.save('trained_dcgan_discriminator.h5')
+            print(f"✅ Saved DCGAN Discriminator as 'trained_dcgan_discriminator.h5'")
+        elif name == 'slicegan':
+            model.generator.save('trained_slicegan_generator.h5')
+            print(f"✅ Saved SliceGAN Generator as 'trained_slicegan_generator.h5'")
+
+def print_training_summary(models, total_time):
+    """Print comprehensive training summary"""
+    print("\n" + "="*50)
+    print("🎯 TRAINING SUMMARY")
+    print("="*50)
+    print(f"⏱️  Total Training Time: {total_time:.1f} seconds")
+    print(f"🤖 Models Trained: {len(models)}")
+    print("\n📈 Model Details:")
+    print("  • Residual Attention U-Net - Semantic Segmentation")
+    print("  • DCGAN - 2D Image Generation")
+    print("  • 3D SliceGAN - Volume Generation")
+    print("\n🎯 Next Steps:")
+    print("  • Use U-Net for mineral phase segmentation")
+    print("  • Generate new SEM images with DCGAN")
+    print("  • Create 3D volumes with SliceGAN")
+    print("  • Load models for inference: keras.models.load_model('model_name.h5')")
+    print("="*50)
+
+
+# -------------------------
+# Usage Example
+# -------------------------
+
+if __name__ == "__main__":
+    # -------- Parameters --------
+    base_path       = r"C:\Users\红米\Desktop\Files"
+    excel_filename  = "Mineral_quant_all_samples.xlsx"
+    sample_mapping  = {
+        '1': 'sample1','2': 'sample2','3': 'sample3','4': 'sample4',
+        '5': 'sample5','6': 'sample6','7': 'sample7','8': 'sample8'
+    }
+    # Usage:
+    #   python this_script.py 3      -> processes sample3
+    #   or set env SAMPLE_ID=3
+    arg_sample_id = None
+    if len(sys.argv) >= 2 and sys.argv[1].isdigit():
+        arg_sample_id = sys.argv[1]
+    else:
+        arg_sample_id = os.environ.get("SAMPLE_ID", "1")
+
+    if arg_sample_id not in sample_mapping:
+        raise SystemExit("❌ Provide a sample number 1-8 (argv or env SAMPLE_ID).")
+
+    sample_to_process = sample_mapping[arg_sample_id]
+    print("="*60)
+    print(f"⚡ PROCESSING ONE SAMPLE ONLY: {sample_to_process}")
+    print("="*60)
+
+    excel_absolute_path = os.path.join(base_path, excel_filename)
+    out_root = os.path.join(base_path, "output", sample_to_process)
+    os.makedirs(out_root, exist_ok=True)
+
+    # 0) Ensure folders
+    dirs = ensure_project_dirs(base_path)
+
+    start_time = time.time()
+    try:
+        # 1) Train ULTRA-FAST on this single sample
+        trainer = TensorFlowShaleTrainer(base_path, excel_absolute_path)
+        models = trainer.train_ultra_fast(sample_name=sample_to_process,
+                                          epochs_unet=20, epochs_dcgan=50, epochs_slicegan=10)
+
+        # 2) Generate final closed 3D volume + Abaqus INP
+        mineral_processor = AdvancedMineralProcessor(excel_absolute_path)
+        mineral_processor.load_and_parse_excel()
+
+        volume, properties = generate_final_3d_volume(
+            models['slicegan'], mineral_processor, sample_to_process,
+            num_volumes=1, save_path=out_root, target_size=(192,192,192)
+        )
+
+        # 3) Save artifacts & visuals
+        save_training_artifacts(models, [volume], [properties['equivalent_youngs_modulus']], save_path=out_root)
+        visualize_results(models, out_root)
+
+        print("\n" + "="*80)
+        print("🎯 SINGLE-SAMPLE PIPELINE COMPLETED")
+        print("="*80)
+        print(f"⏱️  Time: {time.time()-start_time:.1f}s")
+        print(f"📁 Outputs:")
+        print(f"    • Training data: {dirs['Training_Data']}")
+        print(f"    • Visuals:       {dirs['Visualisations']}")
+        print(f"    • TIFF stacks:   {dirs['tiff_stack']}")
+        print(f"    • Abaqus INP:    {os.path.join(base_path, 'abaqus')}")
+        print(f"    • Sample output: {out_root}")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback; traceback.print_exc()
