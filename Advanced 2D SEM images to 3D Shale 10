@@ -1,0 +1,4028 @@
+# =========================
+# SECTION 1 / 4
+# =========================
+import sys
+!{sys.executable} -m pip install "numpy<2" --quiet
+!{sys.executable} -m pip install scikit-image opencv-python matplotlib scipy scikit-learn tensorflow tifffile --quiet
+import json
+import os, math, random, warnings
+import numpy as np
+import pandas as pd
+from scipy import ndimage
+import cv2
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import tensorflow as tf
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import (
+    Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate,
+    Conv2DTranspose, BatchNormalization, Activation,
+    Add, Multiply, Dropout, Reshape, Dense, LeakyReLU, Flatten,
+    Lambda, GlobalAveragePooling2D, Conv3D, MaxPooling3D, Conv3DTranspose,
+    LayerNormalization, MultiHeadAttention, Attention, Embedding,
+    ZeroPadding3D, Cropping3D, SpatialDropout3D, ReLU
+)
+from tensorflow.keras.applications import InceptionV3
+from scipy.linalg import sqrtm
+from tensorflow.keras.optimizers import Adam, RMSprop
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.mixed_precision import set_global_policy
+from tensorflow.keras.utils import Sequence
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import scipy.ndimage as ndimage
+from scipy import stats, spatial
+import scipy
+from scipy.spatial.distance import cdist
+import tifffile
+from skimage.morphology import ball
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+    print("⚠️  PIL not available, using OpenCV for image saving")
+warnings.filterwarnings("ignore", message="numpy.*")
+
+# -------------------------
+# Helpers & metrics (ADDED)
+# -------------------------
+def set_global_seed(seed: int = 42):
+    """Deterministic-ish runs across numpy/tensorflow/python hash."""
+    random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+def safe_makedirs(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def normalize01(x, eps=1e-8):
+    x = x.astype(np.float32)
+    mn, mx = np.min(x), np.max(x)
+    return (x - mn) / (mx - mn + eps)
+
+def clip01(x):
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
+
+def robust_minmax_match(src, ref, eps=1e-6):
+    """Histogram match using percentile anchors for robustness."""
+    s1, s99 = np.percentile(src, 1), np.percentile(src, 99)
+    r1, r99 = np.percentile(ref, 1), np.percentile(ref, 99)
+    out = (src - s1) / (s99 - s1 + eps)
+    return clip01(out) * (r99 - r1) + r1
+
+def patchify_2d(img, patch_size=64, stride=64):
+    """Return (N, H, W) patches + (y,x) positions."""
+    H, W = img.shape[:2]
+    ps, st = patch_size, stride
+    patches, pos = [], []
+    for y in range(0, max(H-ps+1, 1), st):
+        for x in range(0, max(W-ps+1, 1), st):
+            yy, xx = min(y, H-ps), min(x, W-ps)
+            patches.append(img[yy:yy+ps, xx:xx+ps])
+            pos.append((yy, xx))
+    return np.stack(patches, 0), pos
+
+def gaussian3d_kernel(size=5, sigma=1.0):
+    ax = np.arange(-size//2 + 1., size//2 + 1.)
+    xx, yy, zz = np.meshgrid(ax, ax, ax, indexing="ij")
+    k = np.exp(-(xx**2 + yy**2 + zz**2)/(2.*sigma**2))
+    return k / np.sum(k)
+
+# --- lightweight spatial metrics (ADDED)
+def morans_I(volume, window=3):
+    """Very lightweight spatial autocorrelation proxy (not exact Moran's I)."""
+    w = np.ones((window, window, window), np.float32); w /= w.sum()
+    mu = ndimage.convolve(volume, w, mode="nearest")
+    num = np.mean((volume - mu) * (mu - mu.mean()))
+    den = np.var(volume) + 1e-8
+    return float(num / den)
+
+def semivariogram_1d(line, max_lag=16):
+    """Simple 1D semivariogram along a line."""
+    line = line.astype(np.float32).ravel()
+    lags = np.arange(1, max_lag+1)
+    gamma = []
+    for h in lags:
+        diff = line[h:] - line[:-h]
+        gamma.append(0.5 * np.mean(diff*diff))
+    return lags, np.array(gamma, np.float32)
+
+# (kept duplicate name for compatibility; does not reduce lines)
+def percentile_thresholds(arr, ps=(20, 40, 60, 80)):
+    arr = arr.astype(np.float32)
+    return np.percentile(arr, ps)
+
+# -------------------------
+# GPU config & mixed precision
+# -------------------------
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+        print(f"✅ Using {len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print("✅ Mixed precision enabled")
+    except RuntimeError as e:
+        print(f"❌ GPU configuration error: {e}")
+# ============== ADD THESE STANDALONE FUNCTIONS HERE ==============
+def calculate_fid_score(real_images, generated_images):
+    """Calculate Frechet Inception Distance (FID) score as in paper"""
+    # Load pre-trained InceptionV3 model
+    inception = InceptionV3(include_top=False, pooling='avg', input_shape=(299, 299, 3))
+
+    # Preprocess images to 299x299x3
+    real_resized = tf.image.resize(real_images, (299, 299))
+    gen_resized = tf.image.resize(generated_images, (299, 299))
+
+    if real_resized.shape[-1] == 1:
+        real_resized = tf.repeat(real_resized, 3, axis=-1)
+    if gen_resized.shape[-1] == 1:
+        gen_resized = tf.repeat(gen_resized, 3, axis=-1)
+
+    # Get features
+    real_features = inception.predict(real_resized, verbose=0)
+    gen_features = inception.predict(gen_resized, verbose=0)
+
+    # Calculate mean and covariance
+    mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
+    mu2, sigma2 = gen_features.mean(axis=0), np.cov(gen_features, rowvar=False)
+
+    # Calculate FID using paper's formula
+    ssdiff = np.sum((mu1 - mu2) ** 2.0)
+    covmean = sqrtm(sigma1.dot(sigma2))
+
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+    return fid
+
+def calculate_phase_connectivity(volume, phase_thresholds=None):
+    """Calculate phase connectivity metrics"""
+    if phase_thresholds is None:
+        phase_thresholds = np.percentile(volume, [20, 40, 60, 80])
+
+    phases = np.zeros_like(volume, dtype=int)
+    phases[volume < phase_thresholds[0]] = 4
+    phases[(volume >= phase_thresholds[0]) & (volume < phase_thresholds[1])] = 3
+    phases[(volume >= phase_thresholds[1]) & (volume < phase_thresholds[2])] = 2
+    phases[(volume >= phase_thresholds[2]) & (volume < phase_thresholds[3])] = 1
+    phases[volume >= phase_thresholds[3]] = 0
+
+    connectivity_metrics = {}
+    phase_names = ['Silicates', 'Carbonate', 'Others', 'Clay', 'Kerogen']
+
+    for phase_id, phase_name in enumerate(phase_names):
+        phase_mask = (phases == phase_id).astype(np.uint8)
+        labeled, num_features = ndimage.label(phase_mask)
+
+        if num_features > 0:
+            component_sizes = np.bincount(labeled.ravel())[1:]  # exclude background
+            connectivity_metrics[phase_name] = {
+                'num_components': num_features,
+                'largest_component_size': np.max(component_sizes) if len(component_sizes) > 0 else 0,
+                'mean_component_size': np.mean(component_sizes) if len(component_sizes) > 0 else 0,
+                'connectivity_ratio': np.max(component_sizes) / np.sum(component_sizes) if np.sum(component_sizes) > 0 else 0
+            }
+        else:
+            connectivity_metrics[phase_name] = {
+                'num_components': 0,
+                'largest_component_size': 0,
+                'mean_component_size': 0,
+                'connectivity_ratio': 0
+            }
+
+    return connectivity_metrics
+
+def calculate_equivalent_modulus_fem(volume, youngs_modulus_dict, phase_thresholds=None):
+    """Calculate equivalent modulus using FEM approach (simplified)"""
+    if phase_thresholds is None:
+        phase_thresholds = np.percentile(volume, [20, 40, 60, 80])
+
+    # Assign phases based on intensity
+    phases = np.zeros_like(volume, dtype=int)
+    phases[volume < phase_thresholds[0]] = 4  # Kerogen
+    phases[(volume >= phase_thresholds[0]) & (volume < phase_thresholds[1])] = 3  # Clay
+    phases[(volume >= phase_thresholds[1]) & (volume < phase_thresholds[2])] = 2  # Others
+    phases[(volume >= phase_thresholds[2]) & (volume < phase_thresholds[3])] = 1  # Carbonate
+    phases[volume >= phase_thresholds[3]] = 0  # Silicates
+
+    # Convert to material properties
+    phase_to_modulus = {
+        0: youngs_modulus_dict['Silicates'],
+        1: youngs_modulus_dict['Carbonate'],
+        2: youngs_modulus_dict['Others'],
+        3: youngs_modulus_dict['Clay'],
+        4: youngs_modulus_dict['Kerogen']
+    }
+
+    # Calculate volume fractions and equivalent modulus (rule of mixtures)
+    total_voxels = volume.size
+    equivalent_modulus = 0
+
+    for phase_id in range(5):
+        phase_fraction = np.sum(phases == phase_id) / total_voxels
+        equivalent_modulus += phase_fraction * phase_to_modulus[phase_id]
+
+    return equivalent_modulus
+
+def calculate_volume_statistics(volume):
+    """Calculate comprehensive volume statistics"""
+    stats = {
+        'mean_intensity': float(np.mean(volume)),
+        'std_intensity': float(np.std(volume)),
+        'min_intensity': float(np.min(volume)),
+        'max_intensity': float(np.max(volume)),
+        'porosity_05': float(np.mean(volume < 0.5)),
+        'porosity_07': float(np.mean(volume < 0.7)),
+        'homogeneity': float(1 - (np.std(volume) / (np.mean(volume) + 1e-8))),
+        'anisotropy_ratio': float(np.std(volume) / (np.mean(volume) + 1e-8))
+    }
+    return stats
+
+def calculate_spatial_correlation(volume, max_lag=20):
+    """Calculate spatial correlation in 3D volume"""
+    center_x, center_y, center_z = [s//2 for s in volume.shape]
+
+    # Calculate correlation along each axis
+    corr_x = [np.corrcoef(volume[center_x, center_y, :-lag],
+                      volume[center_x, center_y, lag:])[0,1]
+          for lag in range(1, min(max_lag, volume.shape[2]//2))]
+    corr_y = [np.corrcoef(volume[center_x, :-lag, center_z],
+                      volume[center_x, lag:, center_z])[0,1]
+          for lag in range(1, min(max_lag, volume.shape[1]//2))]
+    corr_z = [np.corrcoef(volume[:-lag, center_y, center_z],
+                      volume[lag:, center_y, center_z])[0,1]
+          for lag in range(1, min(max_lag, volume.shape[0]//2))]
+
+    return {
+        'correlation_x': np.nanmean(corr_x) if len(corr_x) > 0 else 0,
+        'correlation_y': np.nanmean(corr_y) if len(corr_y) > 0 else 0,
+        'correlation_z': np.nanmean(corr_z) if len(corr_z) > 0 else 0,
+        'anisotropy_index': max(np.nanmean(corr_x), np.nanmean(corr_y), np.nanmean(corr_z)) /
+                       (min(np.nanmean(corr_x), np.nanmean(corr_y), np.nanmean(corr_z)) + 1e-8)
+    }
+# -------------------------
+# AdvancedMineralProcessor (unchanged logic, kept to preserve lines)
+# -------------------------
+# -------------------------
+class AdvancedMineralProcessor:
+    """Advanced mineral composition processor with exact paper methodology"""
+
+    def __init__(self, excel_path):
+        self.excel_path = excel_path
+        self.mineral_data = {}
+
+        self.sample_mapping = {
+            'sample1': 'Sample 10555\\10555',
+            'sample2': 'Sample 11203\\11203',
+            'sample3': 'Sample 11206\\11206',
+            'sample4': 'Sample 12162\\12162',
+            'sample5': 'Sample 17699\\17699',
+            'sample6': 'Sample 19472\\19472',
+            'sample7': 'Sample 21298\\21298',
+            'sample8': 'Sample 23285\\23285'
+        }
+        self.five_phase_model = {
+            'Silicates': ['Quartz', 'Alkali Feldspar', 'Plagioclase'],
+            'Carbonate': ['Calcite', 'Dolomite', 'Ankerite', 'Siderite'],
+            'Clay': ['Illite', 'Chlorite', 'Kaolinite', 'Muscovite', 'Biotite'],
+            'Kerogen': [],
+            'Others': ['Pyrite', 'Zircon', 'Rutile', 'Ilmenite', 'Apatite', 'Monazite', 'Unclassified']
+        }
+
+        self.youngs_modulus = {
+            'Silicates': 89.6,
+            'Carbonate': 74.6,
+            'Clay': 22.3,
+            'Kerogen': 9.2,
+            'Others': 12.392
+        }
+
+        self.density_values = {
+            'Silicates': 2.65,
+            'Carbonate': 2.71,
+            'Clay': 2.60,
+            'Kerogen': 1.30,
+            'Others': 3.50
+        }
+
+    def load_and_parse_excel(self):
+        print("📊 Loading and parsing Excel data...")
+        try:
+            df = pd.read_excel(self.excel_path, sheet_name='Mineral quant_all samples', header=None)
+            print(f"📐 Excel shape: {df.shape}")
+            self.process_single_sheet_data(df)
+            print("✅ Excel data loaded and parsed successfully")
+        except Exception as e:
+            print(f"❌ Error loading Excel: {e}")
+            print("🔄 Creating realistic compositions based on paper...")
+            self.create_realistic_compositions()
+
+    def process_single_sheet_data(self, df):
+        print("📊 Processing single sheet Excel data...")
+        area_start = self.find_data_start(df, 'MODAL AREA%')
+        wt_start = self.find_data_start(df, 'MODAL WT%')
+        assay_start = self.find_data_start(df, 'ASSAY')
+        properties_start = self.find_data_start(df, 'PROPERTIES')
+        print(f"📊 Section starts - Area: {area_start}, WT: {wt_start}, Assay: {assay_start}, Properties: {properties_start}")
+
+        for sample_key, excel_key in self.sample_mapping.items():
+            sample_data = {
+                'five_phase_area': {},
+                'five_phase_wt': {},
+                'assay': {},
+                'properties': {},
+                'detailed_area': {},
+                'detailed_wt': {}
+            }
+            if area_start >= 0:
+                self.extract_mineral_data(df, area_start, self.find_sample_column(df, excel_key, area_start),
+                                          sample_data['detailed_area'], sample_data['five_phase_area'])
+            if wt_start >= 0:
+                self.extract_mineral_data(df, wt_start, self.find_sample_column(df, excel_key, wt_start),
+                                          sample_data['detailed_wt'], sample_data['five_phase_wt'])
+            if assay_start >= 0:
+                self.extract_assay_data(df, assay_start, self.find_sample_column(df, excel_key, assay_start), sample_data['assay'])
+            if properties_start >= 0:
+                self.extract_properties_data(df, properties_start, self.find_sample_column(df, excel_key, properties_start), sample_data['properties'])
+
+            carbon_content = sample_data['assay'].get('C', 0)
+            kerogen_content = carbon_content * 1.2
+            sample_data['five_phase_area']['Kerogen'] = kerogen_content
+            sample_data['five_phase_wt']['Kerogen'] = kerogen_content
+            self.normalize_compositions(sample_data)
+            self.mineral_data[sample_key] = sample_data
+            print(f"✅ Processed {sample_key}: {sample_data['five_phase_area']}")
+
+    def find_data_start(self, df, keyword='Quartz'):
+        for idx, row in df.iterrows():
+            for cell in row:
+                if isinstance(cell, str) and keyword in cell:
+                    return idx
+        return 0
+
+    def find_sample_column(self, df, excel_key, data_start):
+        header_row = data_start - 1 if data_start > 0 else 0
+        for col_idx in range(len(df.columns)):
+            cell_value = df.iloc[header_row, col_idx]
+            if isinstance(cell_value, str) and excel_key in cell_value:
+                return col_idx
+        return -1
+
+    def extract_mineral_data(self, df, start_row, col_idx, detailed_dict, five_phase_dict):
+        mineral_rows = {}
+        for idx in range(start_row, len(df)):
+            mineral_name = df.iloc[idx, 0]
+            if isinstance(mineral_name, str) and mineral_name.strip():
+                try:
+                    value = float(df.iloc[idx, col_idx])
+                    detailed_dict[mineral_name] = value
+                    mineral_rows[mineral_name] = value
+                except (ValueError, TypeError):
+                    continue
+        for phase, minerals in self.five_phase_model.items():
+            phase_total = 0
+            for mineral in minerals:
+                for detailed_mineral, value in mineral_rows.items():
+                    if mineral.lower() in detailed_mineral.lower():
+                        phase_total += value
+                        break
+            five_phase_dict[phase] = phase_total
+
+    def extract_assay_data(self, df, start_row, col_idx, assay_dict):
+        for idx in range(start_row, len(df)):
+            element = df.iloc[idx, 0]
+            if isinstance(element, str) and element.strip():
+                try:
+                    value = float(df.iloc[idx, col_idx])
+                    assay_dict[element] = value
+                except (ValueError, TypeError):
+                    continue
+
+    def extract_properties_data(self, df, start_row, col_idx, properties_dict):
+        for idx in range(start_row, len(df)):
+            property_name = df.iloc[idx, 0]
+            if isinstance(property_name, str) and property_name.strip():
+                try:
+                    value = float(df.iloc[idx, col_idx])
+                    properties_dict[property_name] = value
+                except (ValueError, TypeError):
+                    continue
+
+    def normalize_compositions(self, sample_data):
+        for comp_type in ['five_phase_area', 'five_phase_wt']:
+            total = sum(sample_data[comp_type].values())
+            if total > 0:
+                for phase in sample_data[comp_type]:
+                    sample_data[comp_type][phase] = (sample_data[comp_type][phase] / total) * 100
+
+    def create_realistic_compositions(self):
+        print("🔄 Creating realistic compositions based on paper...")
+        realistic_data = {
+            'sample1': {'Silicates': 75.71, 'Carbonate': 1.64, 'Clay': 20.14, 'Kerogen': 0.26, 'Others': 2.51},
+            'sample2': {'Silicates': 75.29, 'Carbonate': 6.39, 'Clay': 15.20, 'Kerogen': 1.03, 'Others': 3.12},
+            'sample3': {'Silicates': 63.41, 'Carbonate': 8.59, 'Clay': 24.28, 'Kerogen': 1.34, 'Others': 3.72},
+            'sample4': {'Silicates': 67.29, 'Carbonate': 15.81, 'Clay': 13.30, 'Kerogen': 2.57, 'Others': 3.60},
+            'sample5': {'Silicates': 90.48, 'Carbonate': 1.19, 'Clay': 5.94, 'Kerogen': 0.24, 'Others': 2.39},
+            'sample6': {'Silicates': 44.08, 'Carbonate': 1.40, 'Clay': 50.52, 'Kerogen': 0.22, 'Others': 4.00},
+            'sample7': {'Silicates': 88.79, 'Carbonate': 1.04, 'Clay': 6.84, 'Kerogen': 0.17, 'Others': 3.33},
+            'sample8': {'Silicates': 93.95, 'Carbonate': 2.80, 'Clay': 1.41, 'Kerogen': 0.46, 'Others': 1.84}
+        }
+        for sample_key in self.sample_mapping.keys():
+            composition = realistic_data.get(sample_key, realistic_data['sample1'])
+            self.mineral_data[sample_key] = {
+                'five_phase_area': composition,
+                'five_phase_wt': composition,
+                'assay': {'C': composition['Kerogen'] / 1.2},
+                'properties': {'Sample Density': 2.70, 'Hardness': 5.5},
+                'detailed_area': composition,
+                'detailed_wt': composition
+            }
+
+    def get_sample_composition(self, sample_name):
+        return self.mineral_data.get(sample_name, {})
+
+    def get_phase_modulus(self, phase):
+        return self.youngs_modulus.get(phase, 12.392)
+
+    def get_phase_density(self, phase):
+        return self.density_values.get(phase, 2.70)
+
+# -------------------------
+# AdvancedSEMProcessor (MODIFIED: create_training_patches now multi-scale & overlapped)
+# -------------------------
+class AdvancedSEMProcessor:
+    """Advanced SEM image processor with patch generation"""
+
+    def __init__(self, base_path):
+        self.base_path = base_path
+
+    def load_sample_images(self, sample_name):
+        sample_path = os.path.join(self.base_path, sample_name)
+        print(f"🔬 Loading SEM images from: {sample_path}")
+
+        data = {'mineral_map': None, 'bse': None, 'minerals': {}, 'elements': {}, 'metadata': {}}
+
+        mineral_map_path = self.find_file(sample_path, ['Mineral Map.tif', 'Mineral_Map.tif',
+                                                       'mineral_map.tif', '10555_Mineral_Map_scale.tif'])
+        if mineral_map_path:
+            data['mineral_map'] = self.load_tiff_image(mineral_map_path)
+            print(f"✅ Loaded Mineral Map: {os.path.basename(mineral_map_path)}")
+
+        bse_path = self.find_file(sample_path, ['BSE.tif', 'bse.tif', 'Backscattered.tif'])
+        if bse_path:
+            data['bse'] = self.load_tiff_image(bse_path)
+            print(f"✅ Loaded BSE: {os.path.basename(bse_path)}")
+
+        minerals_path = os.path.join(sample_path, 'Minerals')
+        if os.path.exists(minerals_path):
+            for file in os.listdir(minerals_path):
+                if file.endswith(('.tif', '.tiff')):
+                    mineral_name = os.path.splitext(file)[0]
+                    img_path = os.path.join(minerals_path, file)
+                    data['minerals'][mineral_name] = self.load_tiff_image(img_path)
+                    print(f"✅ Loaded mineral: {mineral_name}")
+
+        elements_path = os.path.join(sample_path, 'Elements')
+        if os.path.exists(elements_path):
+            for file in os.listdir(elements_path):
+                if file.endswith(('.tif', '.tiff')):
+                    element_name = os.path.splitext(file)[0]
+                    img_path = os.path.join(elements_path, file)
+                    data['elements'][element_name] = self.load_tiff_image(img_path)
+                    print(f"✅ Loaded element: {element_name}")
+
+        return data
+
+    def find_file(self, directory, possible_names):
+        for name in possible_names:
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def load_tiff_image(self, file_path):
+        try:
+            img = tifffile.imread(file_path)
+            if img.dtype == np.uint16:
+                img = img.astype(np.float32) / 65535.0
+            elif img.dtype == np.uint8:
+                img = img.astype(np.float32) / 255.0
+            else:
+                img = img.astype(np.float32)
+                if img.max() > 1.0:
+                    img = img / img.max()
+            if img.shape[0] != 1024 or img.shape[1] != 1024:
+                img = cv2.resize(img, (1024, 1024), interpolation=cv2.INTER_CUBIC)
+                print(f"🔄 Resized to: {img.shape}")
+            return img
+        except Exception as e:
+            print(f"❌ Error loading {file_path}: {e}")
+            try:
+                img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    raise ValueError("OpenCV could not read image")
+                if img.dtype == np.uint16:
+                    img = img.astype(np.float32) / 65535.0
+                elif img.dtype == np.uint8:
+                    img = img.astype(np.float32) / 255.0
+                else:
+                    img = img.astype(np.float32)
+                    if img.max() > 1.0:
+                        img = img / img.max()
+                if img.shape[0] != 1024 or img.shape[1] != 1024:
+                    img = cv2.resize(img, (1024, 1024), interpolation=cv2.INTER_CUBIC)
+                return img
+            except Exception as e2:
+                print(f"❌ OpenCV also failed: {e2}")
+                return None
+
+    # -------- MODIFIED: multi-scale + overlap
+    def create_training_patches(self, image, grid_size=10, patch_size=64, use_overlap=True):
+        """Create multi-scale, overlapped training patches (improves continuity)."""
+        if image is None:
+            print("❌ No image provided for patch creation")
+            return None, None
+        img = normalize01(image)
+        stride = patch_size//2 if use_overlap else patch_size
+        p1, pos = patchify_2d(img, patch_size=patch_size, stride=stride)
+        s2 = cv2.resize(img, (img.shape[1]//2, img.shape[0]//2), interpolation=cv2.INTER_AREA)
+        p2, _  = patchify_2d(s2, patch_size=patch_size, stride=stride)
+        s3 = cv2.resize(img, (img.shape[1]//4, img.shape[0]//4), interpolation=cv2.INTER_AREA)
+        p3, _  = patchify_2d(s3, patch_size=patch_size, stride=stride)
+        patches = np.concatenate([p1, p2, p3], axis=0)
+        patches = patches[..., None] if patches.ndim==3 else patches  # ensure channel
+        print(f"✅ Created {patches.shape[0]} patches of {patches.shape[1:]} (3 scales, stride={stride})")
+        return patches, pos
+
+    def enhance_image_quality(self, image):
+        if image is None:
+            return None
+        print("✨ Enhancing image quality...")
+        img_uint8 = (clip01(image) * 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(img_uint8)
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+        smoothed = cv2.GaussianBlur(denoised, (3, 3), 1.0)
+        return smoothed.astype(np.float32) / 255.0
+# =========================
+# SECTION 2 / 4
+# =========================
+
+# ---------- Mineral palette (ADDED)
+class MineralPalette:
+    PHASES = ['Silicates','Carbonate','Others','Clay','Kerogen']
+    DEFAULT = {
+        'Silicates': (1.00, 0.85, 0.20),
+        'Carbonate': (0.20, 0.80, 0.20),
+        'Others'   : (0.85, 0.25, 0.25),
+        'Clay'     : (0.55, 0.35, 0.85),
+        'Kerogen'  : (0.15, 0.15, 0.15),
+    }
+    P2I = {p:i for i,p in enumerate(PHASES)}
+    I2P = {i:p for p,i in P2I.items()}
+
+    def __init__(self, base_path):
+        self.base_path = base_path
+        self.palette = dict(self.DEFAULT)
+
+    def _mean_rgb(self, arr):
+        if arr.ndim == 2:
+            rgb = np.stack([arr]*3, -1)
+        elif arr.shape[-1] > 3:
+            rgb = arr[..., :3]
+        else:
+            rgb = arr
+        rgb = normalize01(rgb)
+        return tuple(np.mean(rgb.reshape(-1,3), axis=0))
+
+    def try_extract_from_folder(self, sample_name):
+        sample_dir = os.path.join(self.base_path, sample_name, "Minerals")
+        if not os.path.isdir(sample_dir): return
+        buckets = {p:[] for p in self.PHASES}
+        for f in os.listdir(sample_dir):
+            if not f.lower().endswith(('.tif','.tiff','.png','.jpg','.jpeg')): continue
+            fp = os.path.join(sample_dir, f)
+            try:
+                arr = tifffile.imread(fp)
+            except Exception:
+                arr = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+            if arr is None: continue
+            lname = f.lower()
+            if any(k in lname for k in ["quartz","feldspar","plagio","silic"]): phase="Silicates"
+            elif any(k in lname for k in ["calcite","dolomite","ankerite","siderite","carbon"]): phase="Carbonate"
+            elif any(k in lname for k in ["illite","chlorite","kaolin","muscov","biotite","clay"]): phase="Clay"
+            elif any(k in lname for k in ["kerogen","organic"]): phase="Kerogen"
+            else: phase="Others"
+            buckets[phase].append(self._mean_rgb(arr))
+        for phase, cols in buckets.items():
+            if len(cols):
+                self.palette[phase] = tuple(np.mean(np.array(cols), axis=0))
+
+    def colorize_labels(self, label_vol):
+        H,W,D = label_vol.shape
+        rgb = np.zeros((H,W,D,3), np.float32)
+        for i, phase in self.I2P.items():
+            rgb[label_vol==i] = self.palette[phase]
+        return rgb
+
+    def id_to_color(self, idx):
+        return self.palette[self.I2P[int(idx)]]
+
+# ---------- Continuity/morphology (ADDED)
+class VolumeContinuityEnforcer:
+    def __init__(self, smooth_sigma=1.0, cc_min_frac=0.0005):
+        self.sigma = float(smooth_sigma)
+        self.cc_min_frac = float(cc_min_frac)
+        self._gauss3d = gaussian3d_kernel(5, 1.0)
+
+    def anisotropic_diffusion_3d(self, vol, iters=6, kappa=45.0, gamma=0.12):
+        vol = vol.astype(np.float32)
+        for _ in range(iters):
+            gx, gy, gz = np.gradient(vol)
+            gmag = np.sqrt(gx*gx + gy*gy + gz*gz)
+            c = 1.0/(1.0+(gmag/kappa)**2)
+
+        # Calculate divergence term properly
+            cx = np.gradient(c * gx, axis=0)
+            cy = np.gradient(c * gy, axis=1)
+            cz = np.gradient(c * gz, axis=2)
+            vol = vol + gamma * (cx + cy + cz)
+        return np.clip(vol, 0, 1)
+
+    def gaussian_3d(self, vol, sigma=None):
+        return ndimage.gaussian_filter(vol, self.sigma if sigma is None else float(sigma))
+
+    def sharpen_boundaries(self, vol, alpha=0.3):
+        blur = self.gaussian_3d(vol, sigma=1.2)
+        return clip01(vol + alpha*(vol - blur))
+
+    def smooth_labels_3d(self, lbl, radius=1):
+        se = ball(int(radius))
+        out = lbl.copy()
+        for _ in range(2):
+            votes = np.zeros((lbl.shape[0], lbl.shape[1], lbl.shape[2], 5), np.int32)
+            for lab in range(5):
+                votes[..., lab] = ndimage.convolve((out==lab).astype(np.int32), se, mode='nearest')
+            out = np.argmax(votes, axis=-1).astype(np.int32)
+        return out
+
+    def prune_small_components(self, lbl):
+        H,W,D = lbl.shape; total = H*W*D
+        cleaned = lbl.copy()
+        for lab in range(5):
+            mask = (lbl==lab).astype(np.uint8)
+            L, n = ndimage.label(mask)
+            if n <= 1: continue
+            sizes = np.bincount(L.ravel())
+            keep = set(np.where(sizes >= max(8, int(self.cc_min_frac*total)))[0]); keep.discard(0)
+            keep_mask = np.isin(L, list(keep))
+            holes = (~keep_mask) & (lbl==lab)
+            if holes.any():
+                _, idx = ndimage.distance_transform_edt(~holes, return_indices=True)
+                cleaned[holes] = lbl[tuple(idx[:, holes])]
+        return cleaned
+
+# ---------- Labeling + composition prior (ADDED)
+class LabelAssigner:
+    def __init__(self, target_comp):
+        self.target = target_comp
+
+    def thresholds_from_intensity(self, vol):
+        return percentile_thresholds(vol, (20,40,60,80))
+
+    def assign(self, vol):
+        t20,t40,t60,t80 = self.thresholds_from_intensity(vol)
+        L = np.zeros_like(vol, np.int32)
+        L[vol<t20] = 4
+        L[(vol>=t20)&(vol<t40)] = 3
+        L[(vol>=t40)&(vol<t60)] = 2
+        L[(vol>=t60)&(vol<t80)] = 1
+        L[vol>=t80] = 0
+        return L
+
+    def soft_rebalance(self, lbl):
+        keys = ['Silicates','Carbonate','Others','Clay','Kerogen']
+        tgt = np.array([self.target.get(k,0) for k in keys], np.float32)
+        cur = np.array([(lbl==i).mean()*100.0 for i in range(5)], np.float32)
+        diff = tgt - cur
+        if np.all(np.abs(diff) < 0.5): return lbl
+        out = lbl.copy()
+        order = np.argsort(-np.abs(diff))
+        kernel = np.ones((3,3,3), np.uint8)
+        for cls in order:
+            if diff[cls] <= 0: continue
+            donor = int(np.argmax(cur - tgt))
+            if donor == cls: continue
+            donor_mask = (out==donor)
+            neighbor = ndimage.binary_dilation((out==cls), structure=kernel)
+            border = donor_mask & neighbor
+            need = int(((diff[cls]/100.0) * lbl.size) / 4)
+            idxs = np.where(border.ravel())[0]
+            if idxs.size == 0: continue
+            sel = np.random.choice(idxs, size=min(need, idxs.size), replace=False)
+            out.ravel()[sel] = cls
+            cur = np.array([(out==i).mean()*100.0 for i in range(5)], np.float32)
+        return out
+
+class CompositionTools:
+    @staticmethod
+    def composition_from_labels(lbl):
+        return dict(zip(['Silicates','Carbonate','Others','Clay','Kerogen'],
+                        [(lbl==i).mean()*100.0 for i in range(5)]))
+
+    @staticmethod
+    def similarity_score(a, b):
+        keys = ['Silicates','Carbonate','Others','Clay','Kerogen']
+        A = np.array([a.get(k,0) for k in keys], np.float32)
+        B = np.array([b.get(k,0) for k in keys], np.float32)
+        return float(1.0 - np.mean(np.abs(A - B)/100.0))
+
+# ---------- Multi-scale assembler (ADDED)
+class RealisticShaleAssembler:
+    """
+    Advanced shale assembler that creates geologically realistic 3D shale volumes
+    with proper bedding, fractures, and mineral distributions
+    """
+
+    def __init__(self, vol_size=128, patch_size=64, mineral_composition=None):
+        self.V = int(vol_size)
+        self.P = int(patch_size)
+        self.mineral_comp = mineral_composition or {
+            'Silicates': 70, 'Carbonate': 15, 'Clay': 10, 'Kerogen': 3, 'Others': 2
+        }
+
+    def create_realistic_shale_volume(self, sem_reference):
+        """Create a geologically realistic 3D shale volume"""
+        print("🏗️ Creating realistic 3D shale volume with geological features...")
+
+        V = self.V
+        volume = np.zeros((V, V, V), dtype=np.float32)
+
+        # Step 1: Create base sedimentary structure
+        volume = self._create_sedimentary_bedding(volume)
+
+        # Step 2: Add mineral phase distributions
+        volume = self._add_mineral_phases(volume, sem_reference)
+
+        # Step 3: Add natural fractures and cracks
+        volume = self._add_fracture_systems(volume)
+
+        # Step 4: Add pore space and organic matter
+        volume = self._add_pore_organic_matter(volume)
+
+        # Step 5: Apply geological smoothing and blending
+        volume = self._geological_post_processing(volume)
+
+        print("✅ Realistic 3D shale volume created")
+        return volume
+
+    def _create_sedimentary_bedding(self, volume):
+        """Create horizontal bedding layers characteristic of shale"""
+        V = volume.shape[0]
+
+        # Create multiple bedding layers with varying thickness
+        z_pos = 0
+        bed_id = 0
+
+        while z_pos < V:
+            # Random bed thickness (2-15 voxels)
+            bed_thickness = np.random.randint(2, 15)
+            if z_pos + bed_thickness >= V:
+                break
+
+            # Each bed has unique properties
+            bed_intensity = 0.3 + 0.6 * np.random.random()
+            bed_texture = self._create_bed_texture(V, V, bed_thickness)
+
+            # Apply bedding with gradual transitions
+            for z in range(bed_thickness):
+                if z_pos + z < V:
+                    transition_factor = self._transition_profile(z, bed_thickness)
+                    volume[:, :, z_pos + z] = bed_intensity * bed_texture[:, :, z] * transition_factor
+
+            z_pos += bed_thickness
+            bed_id += 1
+
+        return volume
+
+    def _create_bed_texture(self, h, w, depth):
+        """Create realistic sedimentary texture for each bed"""
+        texture = np.zeros((h, w, depth), dtype=np.float32)
+
+        for z in range(depth):
+            # Base sedimentary pattern with laminations
+            x, y = np.meshgrid(np.linspace(0, 4*np.pi, w), np.linspace(0, 4*np.pi, h))
+
+            # Multiple frequency components for natural look
+            base = (np.sin(0.5*x + z*0.1) * np.cos(0.5*y) * 0.4 +
+                   np.sin(1.5*x) * np.cos(1.5*y + z*0.2) * 0.3 +
+                   np.sin(3.0*x + z*0.05) * np.cos(3.0*y) * 0.2 +
+                   np.random.normal(0, 0.1, (h, w)))
+
+            # Add grain-like structures
+            grains = self._add_mineral_grains(h, w)
+            texture[:, :, z] = np.clip(base + grains*0.3, 0, 1)
+
+        return texture
+
+    def _add_mineral_grains(self, h, w):
+        """Add realistic mineral grain distributions"""
+        grains = np.zeros((h, w), dtype=np.float32)
+
+        # Add quartz/feldspar grains (bright)
+        n_grains = np.random.randint(50, 150)
+        for _ in range(n_grains):
+            size = np.random.randint(2, 8)
+            center_x = np.random.randint(size, w-size)
+            center_y = np.random.randint(size, h-size)
+            intensity = 0.7 + 0.3 * np.random.random()
+
+            for i in range(-size, size+1):
+                for j in range(-size, size+1):
+                    if 0 <= center_x+i < w and 0 <= center_y+j < h:
+                        dist = np.sqrt(i**2 + j**2)
+                        if dist <= size:
+                            factor = 1.0 - (dist / size)
+                            grains[center_y+j, center_x+i] = max(
+                                grains[center_y+j, center_x+i],
+                                intensity * factor
+                            )
+
+        return grains
+
+    def _add_mineral_phases(self, volume, sem_reference):
+        """Distribute mineral phases according to composition"""
+        V = volume.shape[0]
+
+        # Create probability maps for each mineral phase
+        phase_maps = {}
+        total_prob = 0
+
+        for phase, percentage in self.mineral_comp.items():
+            if percentage > 0:
+                # Each phase has characteristic spatial distribution
+                if phase == 'Silicates':
+                    # Silicates: clustered grains
+                    prob_map = self._create_silicate_distribution(V, V, V)
+                elif phase == 'Clay':
+                    # Clay: fine-grained, layered
+                    prob_map = self._create_clay_distribution(V, V, V)
+                elif phase == 'Carbonate':
+                    # Carbonate: vein-like patterns
+                    prob_map = self._create_carbonate_distribution(V, V, V)
+                elif phase == 'Kerogen':
+                    # Kerogen: organic matter, often in layers
+                    prob_map = self._create_kerogen_distribution(V, V, V)
+                else:
+                    # Others: random distribution
+                    prob_map = np.random.random((V, V, V))
+
+                phase_maps[phase] = prob_map * (percentage / 100.0)
+                total_prob += phase_maps[phase]
+
+        # Normalize and assign phases
+        if total_prob.max() > 0:
+            for phase in phase_maps:
+                phase_maps[phase] = phase_maps[phase] / total_prob
+
+        # Blend SEM reference texture with mineral phases - FIXED
+        if sem_reference is not None:
+            # Convert to grayscale if needed
+            if sem_reference.ndim == 3:
+                sem_gray = np.mean(sem_reference, axis=2)  # Convert RGB to grayscale
+            else:
+                sem_gray = sem_reference
+
+            sem_resized = cv2.resize(sem_gray, (V, V))  # Now this is 2D
+            for z in range(V):
+                volume[:, :, z] = 0.7 * volume[:, :, z] + 0.3 * sem_resized
+
+        return volume
+
+    def _create_silicate_distribution(self, h, w, d):
+        """Create clustered silicate grain distribution"""
+        dist_map = np.zeros((h, w, d), dtype=np.float32)
+
+        # Create grain clusters
+        n_clusters = np.random.randint(5, 15)
+        for _ in range(n_clusters):
+            center_x = np.random.randint(0, w)
+            center_y = np.random.randint(0, h)
+            center_z = np.random.randint(0, d)
+            cluster_size = np.random.randint(10, 30)
+
+            for x in range(max(0, center_x-cluster_size), min(w, center_x+cluster_size)):
+                for y in range(max(0, center_y-cluster_size), min(h, center_y+cluster_size)):
+                    for z in range(max(0, center_z-cluster_size//2), min(d, center_z+cluster_size//2)):
+                        dist = np.sqrt((x-center_x)**2 + (y-center_y)**2 + ((z-center_z)*2)**2)
+                        if dist < cluster_size:
+                            intensity = 1.0 - (dist / cluster_size)
+                            dist_map[y, x, z] = max(dist_map[y, x, z], intensity)
+
+        return dist_map
+
+    def _create_clay_distribution(self, h, w, d):
+        """Create fine-grained clay distribution"""
+        dist_map = np.zeros((h, w, d), dtype=np.float32)
+
+        # Clay is fine-grained and often layered
+        for z in range(d):
+            # Horizontal layering with fine texture
+            base = np.random.normal(0.5, 0.1, (h, w))
+            # Add fine laminations
+            for i in range(3):
+                lam_thickness = np.random.randint(1, 3)
+                lam_pos = np.random.randint(0, h-lam_thickness)
+                base[lam_pos:lam_pos+lam_thickness, :] += 0.2
+
+            dist_map[:, :, z] = np.clip(base, 0, 1)
+
+        return dist_map
+
+    def _create_carbonate_distribution(self, h, w, d):
+        """Create vein-like carbonate distribution"""
+        dist_map = np.zeros((h, w, d), dtype=np.float32)
+
+        # Carbonate often forms veins
+        n_veins = np.random.randint(3, 8)
+        for _ in range(n_veins):
+            # Random vein orientation
+            if np.random.random() > 0.5:
+                # Horizontal vein
+                z_level = np.random.randint(5, d-5)
+                thickness = np.random.randint(1, 4)
+                intensity = 0.8 + 0.2 * np.random.random()
+
+                for z in range(max(0, z_level-thickness), min(d, z_level+thickness)):
+                    dist_map[:, :, z] = np.maximum(dist_map[:, :, z], intensity)
+            else:
+                # Vertical vein
+                x_start = np.random.randint(0, w)
+                vein_width = np.random.randint(2, 6)
+                for x in range(x_start, min(w, x_start+vein_width)):
+                    dist_map[:, x, :] = np.maximum(dist_map[:, x, :], 0.7)
+
+        return dist_map
+
+    def _create_kerogen_distribution(self, h, w, d):
+        """Create organic matter (kerogen) distribution"""
+        dist_map = np.zeros((h, w, d), dtype=np.float32)
+
+        # Kerogen is often in discrete layers or patches
+        n_patches = np.random.randint(10, 30)
+        for _ in range(n_patches):
+            center_x = np.random.randint(0, w)
+            center_y = np.random.randint(0, h)
+            center_z = np.random.randint(0, d)
+            patch_size = np.random.randint(3, 10)
+
+            for x in range(max(0, center_x-patch_size), min(w, center_x+patch_size)):
+                for y in range(max(0, center_y-patch_size), min(h, center_y+patch_size)):
+                    for z in range(max(0, center_z-1), min(d, center_z+2)):  # Flat patches
+                        dist = np.sqrt((x-center_x)**2 + (y-center_y)**2)
+                        if dist < patch_size:
+                            intensity = 0.3 + 0.4 * (1.0 - dist/patch_size)
+                            dist_map[y, x, z] = max(dist_map[y, x, z], intensity)
+
+        return dist_map
+
+    def _add_fracture_systems(self, volume):
+        """Add natural fracture systems"""
+        V = volume.shape[0]
+
+        # Add vertical fractures (common in shale)
+        n_fractures = np.random.randint(3, 8)
+        for _ in range(n_fractures):
+            fracture_x = np.random.randint(10, V-10)
+            fracture_width = np.random.randint(1, 3)
+            fracture_length = np.random.randint(20, V-20)
+
+            for x in range(fracture_x, min(V, fracture_x+fracture_width)):
+                for y in range(fracture_length):
+                    for z in range(V):
+                        # Darken fracture areas
+                        volume[y, x, z] *= 0.6
+
+        # Add some horizontal parting
+        n_partings = np.random.randint(2, 5)
+        for _ in range(n_partings):
+            parting_z = np.random.randint(5, V-5)
+            parting_thickness = np.random.randint(1, 2)
+
+            for z in range(parting_z, min(V, parting_z+parting_thickness)):
+                volume[:, :, z] *= 0.7
+
+        return volume
+
+    def _add_pore_organic_matter(self, volume):
+        """Add pore space and additional organic matter"""
+        V = volume.shape[0]
+
+        # Add micro-porosity
+        porosity_mask = np.random.random((V, V, V)) > 0.95  # 5% porosity
+        volume[porosity_mask] *= 0.3  # Dark pores
+
+        # Add scattered organic matter
+        organic_mask = np.random.random((V, V, V)) > 0.98  # 2% additional organic
+        volume[organic_mask] *= 0.5
+
+        return volume
+
+    def _geological_post_processing(self, volume):
+        """Apply final geological processing"""
+        # Gentle smoothing to mimic natural processes
+        volume = ndimage.gaussian_filter(volume, sigma=0.8)
+
+        # Enhance contrasts slightly
+        volume = np.clip(volume * 1.1, 0, 1)
+
+        # Add final subtle noise for natural appearance
+        noise = np.random.normal(0, 0.02, volume.shape)
+        volume = np.clip(volume + noise, 0, 1)
+
+        return volume
+
+    def _transition_profile(self, position, length):
+        """Create smooth transition between beds"""
+        # Smooth sigmoid-like transition
+        x = (position / length) * 2 - 1  # -1 to 1
+        return 1.0 / (1.0 + np.exp(-4*x))  # Smooth step function
+# ---------- Enhanced Continuous Assembler (ADDED)
+class EnhancedContinuousAssembler:
+    """
+    Enhanced continuous assembler that creates highly continuous 3D shale volumes
+    with perfect geological continuity and natural appearance
+    """
+
+    def __init__(self, vol_size=128, patch_size=64):
+        self.V = int(vol_size)
+        self.P = int(patch_size)
+
+    def create_continuous_shale_volume(self, sem_reference, target_composition):
+        """Create highly continuous 3D shale volume with perfect geological coherence"""
+        print("🏗️ Creating enhanced continuous 3D shale volume...")
+
+        V = self.V
+        volume = np.zeros((V, V, V), dtype=np.float32)
+
+        # Create base geological structure with perfect continuity
+        volume = self._create_perfect_geological_continuity(volume)
+
+        # Incorporate SEM reference texture
+        if sem_reference is not None:
+            volume = self._blend_sem_texture(volume, sem_reference)
+
+        # Apply composition-aware mineral distribution
+        volume = self._apply_composition_distribution(volume, target_composition)
+
+        # Final geological refinement
+        volume = self._geological_refinement(volume)
+
+        print("✅ Enhanced continuous 3D shale volume created")
+        return clip01(volume)
+
+    def _create_perfect_geological_continuity(self, volume):
+        """Create perfectly continuous geological structure"""
+        V = volume.shape[0]
+
+        # Create base sedimentary pattern with perfect continuity
+        x, y, z = np.meshgrid(np.linspace(0, 4*np.pi, V),
+                             np.linspace(0, 4*np.pi, V),
+                             np.linspace(0, 2*np.pi, V), indexing='ij')
+
+        # Multi-scale geological patterns
+        base_pattern = (np.sin(0.5*x) * np.cos(0.5*y) * 0.4 +
+                       np.sin(1.0*x + z*0.3) * np.cos(1.0*y) * 0.3 +
+                       np.sin(2.0*x) * np.cos(2.0*y + z*0.1) * 0.2 +
+                       np.random.normal(0, 0.05, (V, V, V)))
+
+        # Strong horizontal bedding with perfect continuity
+        for z_slice in range(V):
+            bedding_strength = 0.3 + 0.2 * np.sin(z_slice * 0.05)
+            base_pattern[:, :, z_slice] += bedding_strength
+
+        return normalize01(base_pattern)
+
+    def _blend_sem_texture(self, volume, sem_reference):
+        """Blend SEM reference texture while maintaining 3D continuity"""
+        if sem_reference.ndim == 3:
+            sem_gray = np.mean(sem_reference, axis=2)
+        else:
+            sem_gray = sem_reference
+
+        sem_resized = cv2.resize(sem_gray, (self.V, self.V))
+
+        # Blend SEM texture with geological structure
+        for z in range(self.V):
+            blend_factor = 0.6 + 0.2 * np.sin(z * 0.1)  # Varying blend factor
+            volume[:, :, z] = (blend_factor * volume[:, :, z] +
+                              (1 - blend_factor) * sem_resized)
+
+        return volume
+
+    def _apply_composition_distribution(self, volume, target_composition):
+        """Apply composition-aware mineral distribution"""
+        # Use thresholds based on composition percentages
+        total = sum(target_composition.values())
+        cumulative = 0
+        thresholds = []
+
+        phases = ['Silicates', 'Carbonate', 'Clay', 'Kerogen', 'Others']
+        for phase in phases:
+            cumulative += target_composition.get(phase, 0) / total
+            thresholds.append(cumulative)
+
+        thresholds = [t * 0.8 + 0.1 for t in thresholds]  # Map to 0.1-0.9 range
+
+        # Apply composition-based intensity mapping
+        volume_flat = volume.ravel()
+        sorted_idx = np.argsort(volume_flat)
+
+        current_idx = 0
+        for i, threshold in enumerate(thresholds):
+            phase_count = int(len(volume_flat) * threshold)
+            end_idx = min(current_idx + phase_count, len(volume_flat))
+
+            # Assign phase intensities
+            phase_intensity = 0.1 + 0.8 * (i / len(thresholds))
+            volume_flat[sorted_idx[current_idx:end_idx]] = phase_intensity
+            current_idx = end_idx
+
+        return volume_flat.reshape(volume.shape)
+
+    def _geological_refinement(self, volume):
+        """Apply final geological refinement"""
+        # Gentle 3D smoothing for perfect continuity
+        volume = ndimage.gaussian_filter(volume, sigma=(1.2, 1.2, 0.8))
+
+        # Enhance contrasts slightly
+        volume = np.clip(volume * 1.1 - 0.05, 0, 1)
+
+        return volume
+class MultiScaleVolumeAssembler:
+    """
+    Assemble a cubic volume from 2D patches across scales with overlap & blending.
+    """
+    def __init__(self, vol_size=128, patch_size=64, stride=32, smooth_sigma=0.8):
+        self.V = int(vol_size)
+        self.P = int(patch_size)
+        self.S = int(stride)
+        self.kernel = gaussian3d_kernel(size=5, sigma=1.0)
+        self.sigma = float(smooth_sigma)
+
+    def _augment2d(self, p):
+        if np.random.rand()<0.5: p = cv2.flip(p, 1)
+        if np.random.rand()<0.5: p = cv2.flip(p, 0)
+        k = np.random.choice([0,1,2,3])
+        if k: p = np.rot90(p, k)
+        return p
+
+    def assemble(self, patch_bank_list):
+        V = self.V
+        out = np.zeros((V,V,V), np.float32)
+        wts = np.zeros_like(out)
+
+        # Improved: Use more slices for better continuity
+        n_slices = max(8, V // 16)  # Increased from 2 to 8+
+        z_thick  = max(2, V // n_slices)
+
+        for zi in range(n_slices):
+            bank = patch_bank_list[zi % len(patch_bank_list)]
+            if len(bank) == 0:
+                # Create more realistic base pattern
+                base = self._create_structured_noise(self.P, self.P)
+            else:
+                # Select patch with better texture
+                base = self._select_best_patch(bank)
+            base = normalize01(base.squeeze())
+            base = self._augment2d(base)
+
+            # Improved tiling with better blending
+            tiled = self._seamless_tile(base, V, V)
+            tiled = ndimage.gaussian_filter(tiled, self.sigma * 1.5)  # Increased smoothing
+
+            # Add 3D structure with gradual transitions
+            chunk = self._create_3d_chunk(tiled, z_thick)
+            if chunk.ndim == 4:
+                chunk = np.squeeze(chunk, axis=-1)
+            chunk = ndimage.convolve(chunk, self.kernel, mode='nearest', axes=(0,1,2))
+    def assemble_continuous(self, patch_bank_list):
+        """Assemble continuous 3D volume with realistic shale structure"""
+        V = self.V
+        out = np.zeros((V,V,V), np.float32)
+        wts = np.zeros_like(out)
+
+        # Use geological layering approach
+        n_layers = 16  # More layers for better continuity
+        z_thick = max(2, V // n_layers)
+
+        # Create base z-profile with geological correlation
+        z_correlation = 0.95  # Very strong correlation between layers (like real shale)
+
+        for zi in range(n_layers):
+            bank = patch_bank_list[zi % len(patch_bank_list)]
+            if len(bank) == 0:
+                base = self._create_geological_texture(self.P, self.P)
+            else:
+                base = self._select_geological_patch(bank)
+
+            base = normalize01(base.squeeze())
+            if base.ndim == 3:
+                base = np.mean(base, axis=2)
+
+            # Geological-aware tiling
+            tiled = self._geological_tile(base, V, V)
+
+            # Create 3D layer with strong geological continuity
+            chunk = self._create_geological_layer(tiled, z_thick, z_correlation)
+
+            if chunk.ndim == 4:
+                chunk = np.squeeze(chunk, axis=-1)
+
+            # Apply geological smoothing
+            chunk = ndimage.gaussian_filter(chunk, sigma=(0.8, 0.8, 0.6))
+
+            # Safe Z-write with geological positioning
+            z0 = zi * z_thick
+            if z0 >= V:
+                break
+            z_len = min(chunk.shape[2], V - z0)
+
+            h_len = min(chunk.shape[0], V)
+            w_len = min(chunk.shape[1], V)
+
+            out[:h_len, :w_len, z0:z0+z_len] += chunk[:h_len, :w_len, :z_len]
+            wts[:h_len, :w_len, z0:z0+z_len] += 1.0
+
+        out = np.divide(out, np.maximum(wts, 1e-6))
+
+        # Apply final geological coherence
+        out = ndimage.gaussian_filter(out, sigma=(1.2, 1.2, 0.8))
+
+        return clip01(out)
+
+    def _create_geological_texture(self, h, w):
+        """Create geological-looking texture with layering and fractures"""
+        # Base sedimentary pattern
+        x, y = np.meshgrid(np.linspace(0, 8*np.pi, w), np.linspace(0, 8*np.pi, h))
+        base = (np.sin(x) * np.cos(y) * 0.7 +
+                np.sin(2*x + 1) * np.cos(2*y - 1) * 0.3 +
+                np.random.rand(h, w) * 0.4)
+
+        # Add horizontal bedding
+        for i in range(5):
+            bed_thickness = np.random.randint(10, 30)
+            bed_pos = np.random.randint(0, h - bed_thickness)
+            base[bed_pos:bed_pos+bed_thickness, :] += 0.3
+
+        return normalize01(base)
+
+    def _select_geological_patch(self, bank):
+        """Select patch with geological characteristics"""
+        if len(bank) == 0:
+            return self._create_geological_texture(self.P, self.P)
+
+        # Score patches based on geological features (variance, layering)
+        scores = []
+        for patch in bank:
+            if patch.ndim > 2:
+                patch = np.mean(patch, axis=-1)
+
+            # Calculate geological score (high variance + horizontal features)
+            variance = np.var(patch)
+
+            # Detect horizontal features (bedding)
+            horizontal_grad = np.abs(np.gradient(patch, axis=0))
+            horizontal_score = np.mean(horizontal_grad)
+
+            scores.append(variance * horizontal_score)
+
+        return bank[np.argmax(scores)]
+
+    def _geological_tile(self, patch, target_h, target_w):
+        """Tile with geological continuity"""
+        if patch.ndim == 3:
+            patch = np.mean(patch, axis=2)
+
+        # Create larger tile with geological patterns
+        h_rep = int(np.ceil(target_h / patch.shape[0])) + 3
+        w_rep = int(np.ceil(target_w / patch.shape[1])) + 3
+
+        large_tiled = np.tile(patch, (h_rep, w_rep))
+
+        # Apply geological blending
+        tiled_smooth = ndimage.gaussian_filter(large_tiled, sigma=2.0)
+
+        # Crop to target size from geologically interesting area
+        center_y = large_tiled.shape[0] // 2 - target_h // 2
+        center_x = large_tiled.shape[1] // 2 - target_w // 2
+
+        result = large_tiled[center_y:center_y+target_h, center_x:center_x+target_w]
+
+        return result
+
+    def _create_geological_layer(self, slice_2d, depth, correlation=0.95):
+        """Create geological layer with strong depth correlation"""
+        if slice_2d.ndim == 3:
+            if slice_2d.shape[2] <= 3:
+                slice_2d = np.mean(slice_2d, axis=2)
+            else:
+                slice_2d = slice_2d[:, :, 0]
+
+        # Create 3D layer with very strong geological correlation
+        chunk = np.repeat(slice_2d[..., None], depth, axis=2)
+
+        # Add subtle geological variations
+        z_variation = np.linspace(0.97, 1.03, depth)
+
+        # Apply strong geological correlation
+        for z in range(1, depth):
+            chunk[:, :, z] = (correlation * chunk[:, :, z-1] +
+                             (1-correlation) * chunk[:, :, z]) * z_variation[z]
+
+        return np.clip(chunk, 0, 1)
+    def _seamless_tile_continuous(self, patch, target_h, target_w):
+        """Enhanced seamless tiling for continuous volumes"""
+        if patch.ndim == 3:
+            patch = np.mean(patch, axis=2)
+
+        # Use more sophisticated tiling with pyramid blending
+        h_rep = int(np.ceil(target_h / patch.shape[0])) + 2
+        w_rep = int(np.ceil(target_w / patch.shape[1])) + 2
+
+        # Create larger tile and then crop to avoid edge effects
+        large_tiled = np.tile(patch, (h_rep, w_rep))
+
+        # Apply multi-scale Gaussian blur for seamless blending
+        tiled_smooth = ndimage.gaussian_filter(large_tiled, sigma=1.5)
+
+        # Crop to target size from center
+        center_y = large_tiled.shape[0] // 2 - target_h // 2
+        center_x = large_tiled.shape[1] // 2 - target_w // 2
+
+        result = large_tiled[center_y:center_y+target_h, center_x:center_x+target_w]
+
+        return result
+
+    def _create_continuous_3d_chunk(self, slice_2d, depth, correlation=0.9):
+        """Create 3D chunk with very strong depth correlation"""
+        if slice_2d.ndim == 3:
+            if slice_2d.shape[2] <= 3:
+                slice_2d = np.mean(slice_2d, axis=2)
+            else:
+                slice_2d = slice_2d[:, :, 0]
+
+        # Create 3D chunk with very strong correlation
+        chunk = np.repeat(slice_2d[..., None], depth, axis=2)
+
+        # Very gradual depth variations
+        z_profile = np.linspace(0.98, 1.02, depth)  # Minimal variation
+
+        # Apply strong correlation between slices
+        for z in range(1, depth):
+            chunk[:, :, z] = (correlation * chunk[:, :, z-1] +
+                             (1-correlation) * chunk[:, :, z]) * z_profile[z]
+
+        return np.clip(chunk, 0, 1)
+    def _create_structured_noise(self, h, w):
+        """Create structured noise instead of random noise"""
+        x, y = np.meshgrid(np.linspace(0, 4*np.pi, w), np.linspace(0, 4*np.pi, h))
+        noise = (np.sin(x) * np.cos(y) +
+                np.sin(2*x + 1) * np.cos(2*y - 1) * 0.5 +
+                np.random.rand(h, w) * 0.3)
+        return normalize01(noise)
+
+    def _select_best_patch(self, bank):
+        """Select patch with highest texture quality"""
+        if len(bank) == 0:
+            return self._create_structured_noise(self.P, self.P)
+
+        # Calculate texture score (variance + entropy)
+        scores = []
+        for patch in bank:
+            if patch.ndim > 2:
+                patch = np.mean(patch, axis=-1)
+            variance = np.var(patch)
+            # Simple entropy approximation
+            hist = np.histogram(patch, bins=32)[0]
+            hist = hist[hist > 0]
+            entropy = -np.sum(hist * np.log(hist))
+            scores.append(variance * entropy)
+
+        return bank[np.argmax(scores)]
+
+    def _seamless_tile(self, patch, target_h, target_w):
+        """Create seamless tiling with simple replication and smoothing"""
+        # Ensure patch is 2D
+        if patch.ndim == 3:
+            patch = np.mean(patch, axis=2)  # Convert to grayscale if multi-channel
+
+        # Simple tiling without complex blending
+        h_rep = int(np.ceil(target_h / patch.shape[0])) + 1
+        w_rep = int(np.ceil(target_w / patch.shape[1])) + 1
+        tiled = np.tile(patch, (h_rep, w_rep))[:target_h, :target_w]
+
+        # Apply gentle Gaussian blur to reduce visible seams
+        tiled = ndimage.gaussian_filter(tiled, sigma=0.8)
+
+        return tiled
+
+    def _create_3d_chunk(self, slice_2d, depth):
+        """Create 3D chunk with gradual depth variation as in paper"""
+        # Ensure slice_2d is 2D (H, W) not 3D (H, W, C)
+        if slice_2d.ndim == 3:
+            # If it's 3D, take only the first channel or convert to grayscale
+            if slice_2d.shape[2] <= 3:  # RGB or multi-channel
+                slice_2d = np.mean(slice_2d, axis=2)  # Convert to grayscale
+            else:
+                slice_2d = slice_2d[:, :, 0]  # Take first channel
+
+        # Create 3D chunk by repeating the 2D slice with depth correlation
+        chunk = np.repeat(slice_2d[..., None], depth, axis=2)
+
+        # Add structured depth variations (not random noise)
+        z_profile = np.linspace(0.95, 1.05, depth)
+        depth_correlation = 0.8  # Strong correlation between adjacent slices
+
+        for z in range(1, depth):
+            # Each slice is strongly correlated with previous slice
+            chunk[:, :, z] = (depth_correlation * chunk[:, :, z-1] +
+                             (1-depth_correlation) * chunk[:, :, z]) * z_profile[z]
+
+        return np.clip(chunk, 0, 1)
+
+    def assemble(self, patch_bank_list):
+        V = self.V
+        out = np.zeros((V,V,V), np.float32)
+        wts = np.zeros_like(out)
+
+        # Use more slices for better continuity (as in paper)
+        n_slices = 12  # Fixed number for consistent results
+        z_thick  = max(2, V // n_slices)
+
+        for zi in range(n_slices):
+            bank = patch_bank_list[zi % len(patch_bank_list)]
+            if len(bank) == 0:
+                base = self._create_structured_noise(self.P, self.P)
+            else:
+                base = self._select_best_patch(bank)
+
+            # Ensure base is 2D and normalized
+            base = normalize01(base.squeeze())
+            if base.ndim == 3:
+                base = np.mean(base, axis=2)  # Convert to grayscale
+
+            base = self._augment2d(base)
+
+            # Improved tiling with better blending
+            tiled = self._seamless_tile(base, V, V)
+            tiled = ndimage.gaussian_filter(tiled, self.sigma)
+
+            # Add 3D structure with gradual transitions
+            chunk = self._create_3d_chunk(tiled, z_thick)
+            if chunk.ndim == 4:
+                chunk = np.squeeze(chunk, axis=-1)
+
+            # Apply gentle 3D coherence filtering
+            chunk = ndimage.gaussian_filter(chunk, sigma=(0.3, 0.3, 0.2))
+
+            # Safe Z-write with proper bounds checking
+            z0 = zi * z_thick
+            if z0 >= V:
+                break
+            z_len = min(chunk.shape[2], V - z0)
+
+            # Ensure we don't exceed array bounds
+            h_len = min(chunk.shape[0], V)
+            w_len = min(chunk.shape[1], V)
+
+            out[:h_len, :w_len, z0:z0+z_len] += chunk[:h_len, :w_len, :z_len]
+            wts[:h_len, :w_len, z0:z0+z_len] += 1.0
+
+        out = np.divide(out, np.maximum(wts, 1e-6))
+        return clip01(out)
+
+    def make_banks(self, base_img, patch_size=64):
+        s1 = normalize01(base_img)
+        s2 = cv2.resize(s1, (s1.shape[1]//2, s1.shape[0]//2), interpolation=cv2.INTER_AREA)
+        s3 = cv2.resize(s1, (s1.shape[1]//4, s1.shape[0]//4), interpolation=cv2.INTER_AREA)
+        b1, _ = patchify_2d(s1, patch_size=patch_size, stride=patch_size//2)
+        b2, _ = patchify_2d(s2, patch_size=patch_size, stride=patch_size//2)
+        b3, _ = patchify_2d(s3, patch_size=patch_size, stride=patch_size//2)
+        return [b1, b2, b3]
+
+# ---------- 3D refiner (ADDED)
+def build_refiner3d(input_shape=(128,128,128,1), features=16):
+    I = Input(input_shape)
+    x1 = Conv3D(features,3,padding='same',activation='relu')(I)
+    x1 = Conv3D(features,3,padding='same',activation='relu')(x1)
+    p1 = tf.keras.layers.MaxPool3D(2)(x1)
+    x2 = Conv3D(features*2,3,padding='same',activation='relu')(p1)
+    x2 = Conv3D(features*2,3,padding='same',activation='relu')(x2)
+    p2 = tf.keras.layers.MaxPool3D(2)(x2)
+    b  = Conv3D(features*4,3,padding='same',activation='relu')(p2)
+    b  = Conv3D(features*4,3,padding='same',activation='relu')(b)
+    u2 = tf.keras.layers.UpSampling3D(2)(b); u2 = concatenate([u2,x2])
+    y2 = Conv3D(features*2,3,padding='same',activation='relu')(u2)
+    y2 = Conv3D(features*2,3,padding='same',activation='relu')(y2)
+    u1 = tf.keras.layers.UpSampling3D(2)(y2); u1 = concatenate([u1,x1])
+    y1 = Conv3D(features,3,padding='same',activation='relu')(u1)
+    y1 = Conv3D(features,3,padding='same',activation='relu')(y1)
+    O  = Conv3D(1,1,activation='sigmoid')(y1)
+    m  = Model(I,O,name="Refiner3D")
+    m.compile(optimizer=Adam(1e-4), loss='mse')
+    return m
+
+# ---------- Color & export helpers (ADDED)
+class ColorAndExportTools:
+    def __init__(self, base_path, palette: MineralPalette):
+        self.base_path = base_path
+        self.palette = palette
+        safe_makedirs(os.path.join(base_path, "Output/Colored"))
+        safe_makedirs(os.path.join(base_path, "Output/TIFF_Stacks"))
+
+    def save_colored_center_slices(self, label_vol, sample_name):
+        outdir = os.path.join(self.base_path, "Output/Colored", sample_name)
+        safe_makedirs(outdir)
+        rgb = self.palette.colorize_labels(label_vol)
+        zc, yc, xc = label_vol.shape[2]//2, label_vol.shape[1]//2, label_vol.shape[0]//2
+        plt.imsave(os.path.join(outdir, "slice_Z.png"), rgb[:,:,zc])
+        plt.imsave(os.path.join(outdir, "slice_Y.png"), rgb[:,yc,:])
+        plt.imsave(os.path.join(outdir, "slice_X.png"), rgb[xc,:,:])
+        print(f"✅ Colored center slices saved: {outdir}")
+
+    def save_tiff_stack_labels(self, label_vol, sample_name):
+        outfp = os.path.join(self.base_path, "Output/TIFF_Stacks", f"{sample_name}_labels.tif")
+        os.makedirs(os.path.dirname(outfp), exist_ok=True)  # ADD THIS LINE
+        print(f"💾 Saving TIFF stack: {outfp}")
+
+    # Enhanced: Ensure we have proper RGB data
+        palette = MineralPalette(self.base_path)
+        palette.try_extract_from_folder(sample_name)
+
+    # Create proper RGB volume with correct dimensions
+        H, W, D = label_vol.shape
+        rgb_vol = np.zeros((H, W, D, 3), dtype=np.uint8)
+
+        for phase_id in range(5):
+            mask = label_vol == phase_id
+            phase_name = palette.I2P[phase_id]
+            color = np.array(palette.palette[phase_name]) * 255
+            rgb_vol[mask] = color.astype(np.uint8)
+
+
+    # Ensure the volume has proper contrast and isn't all black
+        if np.max(rgb_vol) == 0:
+            print("⚠️  Warning: RGB volume is all black, applying default colors")
+        # Apply default colors if all black
+            default_colors = [
+                [255, 255, 0],    # Silicates - Yellow
+                [0, 255, 0],      # Carbonate - Green
+                [255, 0, 0],      # Others - Red
+                [128, 0, 128],    # Clay - Purple
+                [0, 0, 0]         # Kerogen - Black
+            ]
+            for phase_id in range(5):
+                mask = label_vol == phase_id
+                rgb_vol[mask] = default_colors[phase_id]
+
+    # Save as multi-page TIFF with proper metadata
+        with tifffile.TiffWriter(outfp, bigtiff=False) as tiff:
+            for z in range(D):
+            # Ensure each slice is proper RGB
+                slice_rgb = rgb_vol[:, :, z, :]
+                if slice_rgb.ndim == 2:  # If grayscale, convert to RGB
+                    slice_rgb = np.stack([slice_rgb]*3, axis=-1)
+                tiff.write(slice_rgb, photometric='rgb',
+                        metadata={'minerals': 'Silicates,Carbonate,Clay,Kerogen,Others'})
+
+        print(f"✅ Color TIFF stack saved: {outfp} (shape: {label_vol.shape})")
+        return outfp
+
+def export_rgb_volume_as_tiff(rgb_vol, out_fp):
+    vol8 = (clip01(rgb_vol)*255).astype(np.uint8)          # H,W,D,3
+    vol_pages = np.moveaxis(vol8, 2, 0)                    # D,H,W,3
+    tifffile.imwrite(out_fp, vol_pages)
+
+# ---------- Extra visualizer (ADDED)
+class ExtraVisualizer:
+    def __init__(self, base_path):
+        self.base_path = base_path
+        safe_makedirs(os.path.join(base_path, "Output/Visualizations"))
+
+    def orthogrid(self, vol, sample_name, n=6):
+        idxs = np.linspace(0, vol.shape[2]-1, n, dtype=int)
+        fig, axes = plt.subplots(1, n, figsize=(3*n, 3))
+        for i, z in enumerate(idxs):
+            axes[i].imshow(vol[:,:,z], cmap='gray'); axes[i].set_title(f"Z={z}")
+            axes[i].axis('off')
+        out = os.path.join(self.base_path, 'Output/Visualizations', f'{sample_name}_orthogrid.png')
+        plt.tight_layout(); plt.savefig(out, dpi=180); plt.close()
+        print("✅ Orthogrid:", out)
+
+    def composition_radar(self, target, achieved, sample_name):
+        phases = ['Silicates','Carbonate','Others','Clay','Kerogen']
+        values_t = [target[p] for p in phases]
+        values_a = [achieved.get(p,0) for p in phases]
+        values_t += values_t[:1]; values_a += values_a[:1]
+        angles = np.linspace(0, 2*np.pi, len(values_t))
+        fig = plt.figure(figsize=(6,6))
+        ax = plt.subplot(111, polar=True)
+        ax.plot(angles, values_t, linewidth=2, label='Target'); ax.fill(angles, values_t, alpha=0.1)
+        ax.plot(angles, values_a, linewidth=2, label='Achieved'); ax.fill(angles, values_a, alpha=0.1)
+        ax.set_xticks(angles[:-1]); ax.set_xticklabels(phases)
+        ax.set_ylim(0, max(max(values_t), max(values_a)) * 1.1)
+        ax.legend(loc='upper right', bbox_to_anchor=(1.2, 1.2))
+        out = os.path.join(self.base_path, 'Output/Visualizations', f'{sample_name}_radar.png')
+        plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+        print("✅ Radar:", out)
+# =========================
+# SECTION 3 / 4
+# =========================
+
+# --------- Dice + CE loss (ADDED)
+def dice_coef(y_true, y_pred, smooth=1.0):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(tf.clip_by_value(y_pred, 1e-7, 1.0), tf.float32)
+    axes = tuple(range(1, len(y_pred.shape)-1))
+    inter = tf.reduce_sum(y_true*y_pred, axis=axes)
+    denom = tf.reduce_sum(y_true+y_pred, axis=axes)
+    return tf.reduce_mean((2.*inter+smooth)/(denom+smooth))
+
+def dice_ce_loss(y_true, y_pred, ce_weight=0.5):
+    y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0)
+    ce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+    return ce_weight*ce + (1.0-ce_weight)*(1.0 - dice_coef(y_true, y_pred))
+
+# --------- ResidualAttentionUNet (MODIFIED: build_model uses Dice+CE)
+class ResidualAttentionUNet:
+    """Advanced Residual Attention U-Net for semantic segmentation"""
+
+    def __init__(self, input_size=(64, 64, 1), num_classes=5):
+        self.input_size = input_size
+        self.num_classes = num_classes
+        self.model = self.build_model()
+
+    def residual_block(self, x, filters, kernel_size=3, stride=1):
+        shortcut = x
+        x = BatchNormalization()(x); x = ReLU()(x)
+        x = Conv2D(filters, kernel_size, strides=stride, padding='same')(x)
+        x = BatchNormalization()(x); x = ReLU()(x)
+        x = Conv2D(filters, kernel_size, strides=1, padding='same')(x)
+        if shortcut.shape[-1] != filters or stride != 1:
+            shortcut = Conv2D(filters, 1, strides=stride, padding='same')(shortcut)
+        x = Add()([x, shortcut])
+        return x
+
+    def attention_block(self, x, g, filters):
+        theta_x = Conv2D(filters, 1, strides=1, padding='same')(x)
+        phi_g   = Conv2D(filters, 1, strides=1, padding='same')(g)
+        add     = Add()([theta_x, phi_g])
+        relu    = ReLU()(add)
+        psi     = Conv2D(1, 1, strides=1, padding='same')(relu)
+        sigmoid = Activation('sigmoid')(psi)
+        return Multiply()([x, sigmoid])
+    def build_resnet18_3d(input_shape=(64, 64, 64, 1)):
+        """ResNet-18 3D architecture for equivalent modulus prediction (as in paper)"""
+        def residual_block(x, filters, stride=1):
+            shortcut = x
+            x = Conv3D(filters, 3, strides=stride, padding='same')(x)
+            x = BatchNormalization()(x)
+            x = ReLU()(x)
+            x = Conv3D(filters, 3, strides=1, padding='same')(x)
+            x = BatchNormalization()(x)
+
+            if stride != 1 or shortcut.shape[-1] != filters:
+                shortcut = Conv3D(filters, 1, strides=stride, padding='same')(shortcut)
+                shortcut = BatchNormalization()(shortcut)
+
+            x = Add()([x, shortcut])
+            x = ReLU()(x)
+            return x
+
+        inputs = Input(input_shape)
+
+    # Initial conv
+        x = Conv3D(64, 7, strides=2, padding='same')(inputs)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        x = MaxPooling3D(3, strides=2, padding='same')(x)
+
+    # Residual blocks
+        x = residual_block(x, 64)
+        x = residual_block(x, 64)
+        x = residual_block(x, 128, stride=2)
+        x = residual_block(x, 128)
+        x = residual_block(x, 256, stride=2)
+        x = residual_block(x, 256)
+        x = residual_block(x, 512, stride=2)
+        x = residual_block(x, 512)
+
+    # Final layers
+        x = GlobalAveragePooling3D()(x)
+        x = Dense(512, activation='relu')(x)
+        x = Dropout(0.5)(x)
+        outputs = Dense(1, activation='linear', name='equivalent_modulus')(x)
+
+        model = Model(inputs, outputs, name='ResNet18_3D')
+        model.compile(optimizer=Adam(1e-4), loss='mse', metrics=['mae'])
+        return model
+    def build_resnet18_3d(input_shape=(64, 64, 64, 1)):
+        """ResNet-18 3D architecture for equivalent modulus prediction (as in paper)"""
+        def residual_block(x, filters, stride=1):
+            shortcut = x
+            x = Conv3D(filters, 3, strides=stride, padding='same')(x)
+            x = BatchNormalization()(x)
+            x = ReLU()(x)
+            x = Conv3D(filters, 3, strides=1, padding='same')(x)
+            x = BatchNormalization()(x)
+
+            if stride != 1 or shortcut.shape[-1] != filters:
+                shortcut = Conv3D(filters, 1, strides=stride, padding='same')(shortcut)
+                shortcut = BatchNormalization()(shortcut)
+
+            x = Add()([x, shortcut])
+            x = ReLU()(x)
+            return x
+
+        inputs = Input(input_shape)
+
+    # Initial conv
+        x = Conv3D(64, 7, strides=2, padding='same')(inputs)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        x = MaxPooling3D(3, strides=2, padding='same')(x)
+
+    # Residual blocks
+        x = residual_block(x, 64)
+        x = residual_block(x, 64)
+        x = residual_block(x, 128, stride=2)
+        x = residual_block(x, 128)
+        x = residual_block(x, 256, stride=2)
+        x = residual_block(x, 256)
+        x = residual_block(x, 512, stride=2)
+        x = residual_block(x, 512)
+
+    # Final layers
+        x = GlobalAveragePooling3D()(x)
+        x = Dense(512, activation='relu')(x)
+        x = Dropout(0.5)(x)
+        outputs = Dense(1, activation='linear', name='equivalent_modulus')(x)
+
+        model = Model(inputs, outputs, name='ResNet18_3D')
+        model.compile(optimizer=Adam(1e-4), loss='mse', metrics=['mae'])
+        return model
+
+
+    def build_model(self):
+        inputs = Input(self.input_size)
+        e1 = self.residual_block(inputs, 32); p1 = MaxPooling2D(2)(e1)
+        e2 = self.residual_block(p1, 64);     p2 = MaxPooling2D(2)(e2)
+        e3 = self.residual_block(p2, 128);    p3 = MaxPooling2D(2)(e3)
+        b  = self.residual_block(p3, 256)
+        d3 = Conv2DTranspose(128, 2, strides=2, padding='same')(b)
+        a3 = self.attention_block(e3, d3, 128); d3 = concatenate([d3, a3]); d3 = self.residual_block(d3, 128)
+        d2 = Conv2DTranspose(64, 2, strides=2, padding='same')(d3)
+        a2 = self.attention_block(e2, d2,  64); d2 = concatenate([d2, a2]); d2 = self.residual_block(d2,  64)
+        d1 = Conv2DTranspose(32, 2, strides=2, padding='same')(d2)
+        a1 = self.attention_block(e1, d1,  32); d1 = concatenate([d1, a1]); d1 = self.residual_block(d1,  32)
+        outputs = Conv2D(self.num_classes, 1, activation='softmax')(d1)
+        model = Model(inputs, outputs, name='ResidualAttentionUNet')
+        model.compile(optimizer=Adam(learning_rate=1e-4), loss=dice_ce_loss, metrics=['accuracy', dice_coef])
+        print("✅ Residual Attention U-Net (Dice+CE) built successfully")
+        return model
+
+    def train_fast(self, patches, epochs=60, batch_size=8):
+        print("🚀 Training Residual Attention U-Net with enhanced parameters...")
+        patches_gray = np.mean(patches, axis=-1) if patches.ndim == 4 else patches
+        labels = self.create_synthetic_labels(patches_gray)
+        from tensorflow.keras.utils import to_categorical
+        labels_categorical = to_categorical(labels, self.num_classes)
+        patches_expanded = np.expand_dims(patches_gray, axis=-1) if patches_gray.ndim == 3 else patches_gray
+
+        # Enhanced training with callbacks
+        callbacks = [
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_dice_coef', patience=10, restore_best_weights=True, mode='max'
+            )
+        ]
+
+        history = self.model.fit(
+            patches_expanded, labels_categorical,
+            batch_size=batch_size,
+            epochs=epochs,
+            validation_split=0.2,
+            verbose=1,
+            callbacks=callbacks
+        )
+        print("✅ U-Net training completed")
+        return history
+
+    def create_synthetic_labels(self, patches):
+        labels = np.zeros((patches.shape[0], patches.shape[1], patches.shape[2]), dtype=np.int32)
+        for i, patch in enumerate(patches):
+            thresholds = np.percentile(patch, [20, 40, 60, 80])
+            labels[i][patch < thresholds[0]] = 4
+            labels[i][(patch >= thresholds[0]) & (patch < thresholds[1])] = 3
+            labels[i][(patch >= thresholds[1]) & (patch < thresholds[2])] = 2
+            labels[i][(patch >= thresholds[2]) & (patch < thresholds[3])] = 1
+            labels[i][patch >= thresholds[3]] = 0
+        return labels
+
+    def segment_patches(self, patches):
+        patches_gray = np.mean(patches, axis=-1) if patches.ndim == 4 and patches.shape[-1] == 3 else patches
+        patches_expanded = np.expand_dims(patches_gray, axis=-1)
+        predictions = self.model.predict(patches_expanded, verbose=0)
+        return np.argmax(predictions, axis=-1)
+
+# --------- AdvancedSliceGAN3D (kept)
+class AdvancedSliceGAN3D:
+    """Advanced 3D SliceGAN with improved architecture"""
+
+    def __init__(self, latent_dim=128, volume_size=64):
+        self.latent_dim = latent_dim
+        self.volume_size = volume_size
+        self.generator = self.build_generator()
+        self.discriminators = self.build_discriminators()
+        self.gan = self.build_gan()
+        print("🤖 Advanced SliceGAN 3D Initialized")
+
+    def build_generator(self):
+        model = Sequential([
+            Dense(4*4*4*256, input_dim=self.latent_dim),
+            Reshape((4, 4, 4, 256)),
+            BatchNormalization(), LeakyReLU(0.2),
+            Conv3DTranspose(128, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+            Conv3DTranspose(64, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+            Conv3DTranspose(32, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+            Conv3DTranspose(16, 4, strides=2, padding='same'),
+            BatchNormalization(), LeakyReLU(0.2),
+            Conv3DTranspose(1, 3, strides=1, padding='same', activation='tanh')
+        ], name='Advanced3DGenerator')
+        model.compile(optimizer=Adam(learning_rate=2e-4, beta_1=0.5), loss='mse')
+        return model
+
+    def build_discriminators(self):
+        def build_discriminator():
+            model = Sequential([
+                Conv2D(32, 4, strides=2, padding='same', input_shape=(64, 64, 1)),
+                LeakyReLU(0.2), Dropout(0.3),
+                Conv2D(64, 4, strides=2, padding='same'),
+                BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+                Conv2D(128, 4, strides=2, padding='same'),
+                BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+                Conv2D(256, 4, strides=2, padding='same'),
+                BatchNormalization(), LeakyReLU(0.2), Dropout(0.3),
+                Flatten(), Dense(1, activation='sigmoid')
+            ])
+            model.compile(optimizer=Adam(learning_rate=2e-4, beta_1=0.5),
+                         loss='binary_crossentropy', metrics=['accuracy'])
+            return model
+        return [build_discriminator() for _ in range(3)]
+
+    def build_gan(self):
+        for disc in self.discriminators:
+            disc.trainable = False
+        gan_input = Input(shape=(self.latent_dim,))
+        generated_volume = self.generator(gan_input)
+        slice_x = Lambda(lambda x: tf.reduce_mean(x, axis=1))(generated_volume)
+        slice_y = Lambda(lambda x: tf.reduce_mean(x, axis=2))(generated_volume)
+        slice_z = Lambda(lambda x: tf.reduce_mean(x, axis=3))(generated_volume)
+        validity_x = self.discriminators[0](slice_x)
+        validity_y = self.discriminators[1](slice_y)
+        validity_z = self.discriminators[2](slice_z)
+        avg_validity = Lambda(lambda x: (x[0] + x[1] + x[2]) / 3)([validity_x, validity_y, validity_z])
+        gan = Model(gan_input, avg_validity, name='AdvancedSliceGAN')
+        gan.compile(optimizer=Adam(learning_rate=2e-4, beta_1=0.5), loss='binary_crossentropy')
+        return gan
+
+    def train_fast(self, real_patches, epochs=30, batch_size=8):
+        print(f"🚀 Training Advanced SliceGAN for {epochs} epochs...")
+        real_patches_expanded = np.expand_dims(real_patches, axis=-1)
+        d_losses = [[] for _ in range(3)]; g_losses = []
+        valid = np.ones((batch_size, 1)); fake = np.zeros((batch_size, 1))
+        for epoch in range(epochs):
+            for axis in range(3):
+                idx = np.random.randint(0, real_patches_expanded.shape[0], batch_size)
+                if real_patches_expanded.shape[-1] == 3:
+                    real_patches_gray = np.mean(real_patches_expanded, axis=-1, keepdims=True)
+                else:
+                    real_patches_gray = real_patches_expanded
+                real_slices = real_patches_gray[idx]
+                noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+                fake_volumes = self.generator.predict(noise, verbose=0)
+                if axis == 0: fake_slices = np.mean(fake_volumes, axis=1)
+                elif axis == 1: fake_slices = np.mean(fake_volumes, axis=2)
+                else: fake_slices = np.mean(fake_volumes, axis=3)
+                fake_slices = np.expand_dims(fake_slices, axis=-1)
+                if len(real_slices.shape) == 5:
+                    real_slices = real_slices.squeeze(-1)
+                if real_slices.shape[-1] == 3:
+                    real_slices_gray = np.mean(real_slices, axis=-1, keepdims=True)
+                else:
+                    real_slices_gray = real_slices
+                if fake_slices is not None and hasattr(fake_slices, 'shape'):
+                    if len(fake_slices.shape) == 4 and fake_slices.shape[-1] != 1:
+                        fake_slices = np.expand_dims(fake_slices, axis=-1)
+                d_loss_real = self.discriminators[axis].train_on_batch(real_slices_gray, valid)
+                try:
+                    fake_slices_np = fake_slices.numpy() if hasattr(fake_slices, 'numpy') else np.array(fake_slices)
+                    if fake_slices_np.ndim == 3:
+                        fake_slices_np = np.expand_dims(fake_slices_np, axis=-1)
+                    elif fake_slices_np.ndim == 4 and fake_slices_np.shape[-1] != 1:
+                        fake_slices_np = np.expand_dims(np.mean(fake_slices_np, axis=-1), axis=-1)
+                    d_loss_fake = self.discriminators[axis].train_on_batch(fake_slices_np, fake)
+                except Exception as e:
+                    print(f"❌ Error processing fake slices: {e}")
+                    d_loss_fake = [1.0, 0.0]
+                d_loss = 0.5 * np.add(d_loss_real[0], d_loss_fake[0])
+                d_losses[axis].append(d_loss)
+            noise = np.random.normal(0, 1, (batch_size, self.latent_dim))
+            g_loss = self.gan.train_on_batch(noise, valid)
+            g_losses.append(g_loss)
+            if epoch % 5 == 0:
+                print(f"📊 Epoch {epoch}, D Losses: {[d_losses[i][-1] for i in range(3)]}, G Loss: {g_loss:.4f}")
+        print("✅ SliceGAN training completed")
+        return d_losses, g_losses
+
+    def generate_3d_volumes(self, num_samples=50):
+        print(f"🎨 Generating {num_samples} 3D volumes...")
+        noise = np.random.normal(0, 1, (num_samples, self.latent_dim))
+        volumes = self.generator.predict(noise, verbose=0)
+        return volumes[:, :, :, :, 0]
+
+# --------- Composition-guided selector (kept)
+class CompositionGuidedSelector:
+    def __init__(self, mineral_processor):
+        self.mineral_processor = mineral_processor
+
+    def select_best_volume(self, volumes, sample_name, target_composition):
+        print("🏆 Selecting best volume based on composition matching...")
+        best_volume, best_score, best_composition = None, -1, None
+        for i, volume in enumerate(volumes):
+            volume_comp = self.analyze_volume_composition(volume)
+            score = self.calculate_composition_similarity(volume_comp, target_composition)
+            if score > best_score:
+                best_score = score; best_volume = volume; best_composition = volume_comp
+        print(f"✅ Best volume selected with similarity score: {best_score:.4f}")
+        print(f"📊 Target composition: {target_composition}")
+        print(f"📊 Best volume composition: {best_composition}")
+        return best_volume, best_score, best_composition
+
+    def analyze_volume_composition(self, volume):
+        thresholds = np.percentile(volume, [20, 40, 60, 80])
+        composition = {
+            'Silicates': np.mean(volume >= thresholds[3]),
+            'Carbonate': np.mean((volume >= thresholds[2]) & (volume < thresholds[3])),
+            'Others':    np.mean((volume >= thresholds[1]) & (volume < thresholds[2])),
+            'Clay':      np.mean((volume >= thresholds[0]) & (volume < thresholds[1])),
+            'Kerogen':   np.mean(volume < thresholds[0])
+        }
+        total = sum(composition.values())
+        for phase in composition:
+            composition[phase] = (composition[phase] / total) * 100
+        return composition
+
+    def calculate_composition_similarity(self, volume_comp, target_comp):
+        score = 0
+        for phase in target_comp:
+            target_val = target_comp[phase]
+            volume_val = volume_comp.get(phase, 0)
+            phase_similarity = 1 - abs(target_val - volume_val) / 100.0
+            score += phase_similarity
+        return score / len(target_comp)
+
+# --------- Abaqus exporter (kept)
+class AdvancedAbaqusExporter:
+    def __init__(self, mineral_processor):
+        self.mineral_processor = mineral_processor
+        self.base_path = base_path if base_path else r"C:\Users\红米\Desktop\Files"
+
+    def export_to_abaqus(self, volume, sample_name, output_dir):
+        print("💾 Exporting to Abaqus INP format...")
+        material_volume = self.assign_material_phases(volume)
+        nodes, elements = self.create_hexahedral_mesh(material_volume)
+        inp_path = os.path.join(output_dir, f"{sample_name}_model.inp")
+        self.write_inp_file(inp_path, nodes, elements, material_volume)
+        prop_path = os.path.join(output_dir, f"{sample_name}_materials.py")
+        self.write_material_properties(prop_path, sample_name)
+        print(f"✅ Abaqus files exported:\n   - INP file: {inp_path}\n   - Material properties: {prop_path}")
+        return inp_path, prop_path
+
+    def assign_material_phases(self, volume):
+        thresholds = np.percentile(volume, [20, 40, 60, 80])
+        mv = np.zeros_like(volume, dtype=np.int32)
+        mv[volume < thresholds[0]] = 4
+        mv[(volume >= thresholds[0]) & (volume < thresholds[1])] = 3
+        mv[(volume >= thresholds[1]) & (volume < thresholds[2])] = 2
+        mv[(volume >= thresholds[2]) & (volume < thresholds[3])] = 1
+        mv[volume >= thresholds[3]] = 0
+        return mv
+
+    def create_hexahedral_mesh(self, material_volume):
+        # Smart downsampling for optimal file size and Abaqus compatibility
+        target_size = 40  # Balanced size for quality and file size
+        original_shape = material_volume.shape
+
+        # Calculate scale factor to reach target size
+        max_dim = max(original_shape)
+        scale_factor = target_size / max_dim
+
+        new_shape = tuple(max(20, int(s * scale_factor)) for s in original_shape)
+
+        print(f"🔩 Downsampling from {original_shape} to {new_shape} for Abaqus compatibility...")
+
+        # Use order=0 for nearest neighbor to preserve material labels
+        material_volume = ndimage.zoom(material_volume,
+                                     [new_shape[i]/original_shape[i] for i in range(3)],
+                                     order=0)
+
+        nx, ny, nz = material_volume.shape[:3]
+        print(f"🔩 Creating mesh with {nx}x{ny}x{nz} elements for Abaqus...")
+
+        nodes = []
+        node_id = 1
+        node_map = {}
+
+        # Create nodes with proper spacing for Abaqus
+        for i in range(nx + 1):
+            for j in range(ny + 1):
+                for k in range(nz + 1):
+                    nodes.append([node_id, float(i), float(j), float(k)])
+                    node_map[(i, j, k)] = node_id
+                    node_id += 1
+
+        elements = []
+        elem_id = 1
+
+        # Create hexahedral elements compatible with Abaqus
+        for i in range(nx):
+            for j in range(ny):
+                for k in range(nz):
+                    n1 = node_map[(i, j, k)]
+                    n2 = node_map[(i+1, j, k)]
+                    n3 = node_map[(i+1, j+1, k)]
+                    n4 = node_map[(i, j+1, k)]
+                    n5 = node_map[(i, j, k+1)]
+                    n6 = node_map[(i+1, j, k+1)]
+                    n7 = node_map[(i+1, j+1, k+1)]
+                    n8 = node_map[(i, j+1, k+1)]
+                    material_id = material_volume[i, j, k] + 1  # Abaqus material IDs start from 1
+                    elements.append([elem_id, n1, n2, n3, n4, n5, n6, n7, n8, material_id])
+                    elem_id += 1
+
+        print(f"✅ Mesh created: {len(nodes)} nodes, {len(elements)} elements")
+        estimated_size_kb = (len(elements) * 0.2) + (len(nodes) * 0.05)
+        print(f"📊 Estimated file size: ~{estimated_size_kb:.1f}KB")
+
+        return nodes, elements
+
+    def write_inp_file(self, file_path, nodes, elements, material_volume):
+    # Ensure directory exists
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)  # ADD THIS LINE
+        material_names = ['SILICATES', 'CARBONATE', 'OTHERS', 'CLAY', 'KEROGEN']
+
+        with open(file_path, 'w') as f:
+        # Write header
+            f.write("*HEADING\n")
+            f.write("3D Shale Microstructure - Advanced Mineral Reconstruction\n")
+            f.write("** Generated by AdvancedShaleReconstructor3D\n")
+            f.write("** Optimized for Abaqus CAE import\n**\n")
+
+            # Write nodes
+            f.write("*NODE\n")
+            for node in nodes:
+                f.write(f"{int(node[0])}, {node[1]:.6f}, {node[2]:.6f}, {node[3]:.6f}\n")
+
+            # Write elements with C3D8R type for reduced integration
+            f.write("*ELEMENT, TYPE=C3D8R\n")
+            for elem in elements:
+                elem_line = f"{int(elem[0])}"
+                for node_id in elem[1:9]:
+                    elem_line += f", {int(node_id)}"
+                f.write(elem_line + "\n")
+
+            # Write element sets for each material
+            for mat_id, mat_name in enumerate(material_names):
+                f.write(f"*ELSET, ELSET={mat_name}_ELEMENTS\n")
+                mat_elements = [e[0] for e in elements if e[-1] == mat_id]
+
+                # Write in chunks of 16 elements per line
+                line_elements = []
+                for i, elem_id in enumerate(mat_elements):
+                    line_elements.append(str(elem_id))
+                    if (i + 1) % 16 == 0 or i == len(mat_elements) - 1:
+                        f.write(", ".join(line_elements) + "\n")
+                        line_elements = []
+
+            # Write material sections
+            for mat_id, mat_name in enumerate(material_names):
+                f.write(f"*SOLID SECTION, ELSET={mat_name}_ELEMENTS, MATERIAL={mat_name}\n")
+                f.write("1.,\n")
+
+            # Write boundary conditions
+            f.write("** BOUNDARY CONDITIONS\n")
+            f.write("*BOUNDARY\n")
+
+            # Find and write bottom nodes (Z=0)
+            bottom_nodes = [node[0] for node in nodes if abs(node[3]) < 1e-6]
+            if bottom_nodes:
+                # Write bottom nodes in chunks
+                f.write("*NSET, NSET=BOTTOM_NODES\n")
+                line_nodes = []
+                for i, node_id in enumerate(bottom_nodes):
+                    line_nodes.append(str(node_id))
+                    if (i + 1) % 16 == 0 or i == len(bottom_nodes) - 1:
+                        f.write(", ".join(line_nodes) + "\n")
+                        line_nodes = []
+
+                f.write("*BOUNDARY\n")
+                f.write("BOTTOM_NODES, 3, 3\n")
+
+            f.write("**\n** END OF INPUT FILE\n")
+
+    def write_material_properties(self, file_path, sample_name):
+        material_names = ['SILICATES', 'CARBONATE', 'OTHERS', 'CLAY', 'KEROGEN']
+        with open(file_path, 'w') as f:
+            f.write('"""\nMaterial Properties for Abaqus Analysis\nGenerated by AdvancedShaleReconstructor3D\n"""\n\n')
+            f.write('from abaqus import *\nfrom abaqusConstants import *\n\n')
+            f.write('def create_materials():\n    """Create material definitions in Abaqus"""\n\n')
+            for mat_name in material_names:
+                modulus = self.mineral_processor.get_phase_modulus(mat_name)
+                density = self.mineral_processor.get_phase_density(mat_name)
+                f.write(f'    # {mat_name} material\n')
+                f.write(f'    mdb.models["Model-1"].Material(name="{mat_name}_MATERIAL")\n')
+                f.write(f'    mdb.models["Model-1"].materials["{mat_name}_MATERIAL"].Elastic(table=(({modulus}, 0.25), ))\n')
+                f.write(f'    mdb.models["Model-1"].materials["{mat_name}_MATERIAL"].Density(table=(({density}, ), ))\n')
+                f.write(f'    print("Created {mat_name} material: E={modulus} GPa, ρ={density} g/cm³")\n\n')
+            f.write('    print("All materials created successfully")\n\n')
+            f.write('if __name__ == "__main__":\n    create_materials()\n')
+    def export_abaqus_cae_compatible(self, volume, sample_name):
+        """Export in CAE-compatible format with small file size (<5MB)"""
+        print("💾 Creating CAE-compatible export (<5MB)...")
+
+        abaqus_dir = os.path.join(self.base_path, 'Output/Abaqus')
+        os.makedirs(abaqus_dir, exist_ok=True)
+
+    # More aggressive downsampling for small file size
+        target_size = 24  # Reduced from 32 to 24 for smaller file
+        original_shape = volume.shape
+        scale_factor = target_size / max(original_shape)
+        new_shape = tuple(max(16, int(s * scale_factor)) for s in original_shape)
+
+        print(f"🔩 Downsampling to {new_shape} for small CAE file...")
+
+        volume_downsampled = ndimage.zoom(volume,
+                                    [new_shape[i]/original_shape[i] for i in range(3)],
+                                    order=0)  # order=0 for nearest neighbor
+
+    # Assign material phases
+        thresholds = np.percentile(volume_downsampled, [20, 40, 60, 80])
+        material_volume = np.zeros_like(volume_downsampled, dtype=np.int8)  # Use int8 to save space
+
+        material_volume[volume_downsampled < thresholds[0]] = 5  # Kerogen
+        material_volume[(volume_downsampled >= thresholds[0]) & (volume_downsampled < thresholds[1])] = 4  # Clay
+        material_volume[(volume_downsampled >= thresholds[1]) & (volume_downsampled < thresholds[2])] = 3  # Others
+        material_volume[(volume_downsampled >= thresholds[2]) & (volume_downsampled < thresholds[3])] = 2  # Carbonate
+        material_volume[volume_downsampled >= thresholds[3]] = 1  # Silicates
+
+    # Create simplified mesh
+        nx, ny, nz = material_volume.shape
+        nodes = []
+        node_id = 1
+        node_map = {}
+
+    # Create nodes with integer coordinates to reduce file size
+        for i in range(nx + 1):
+            for j in range(ny + 1):
+                for k in range(nz + 1):
+                    nodes.append([node_id, i, j, k])  # Integer coordinates
+                    node_map[(i, j, k)] = node_id
+                    node_id += 1
+
+        elements = []
+        elem_id = 1
+
+    # Create hexahedral elements
+        for i in range(nx):
+            for j in range(ny):
+                for k in range(nz):
+                    n1 = node_map[(i, j, k)]
+                    n2 = node_map[(i+1, j, k)]
+                    n3 = node_map[(i+1, j+1, k)]
+                    n4 = node_map[(i, j+1, k)]
+                    n5 = node_map[(i, j, k+1)]
+                    n6 = node_map[(i+1, j, k+1)]
+                    n7 = node_map[(i+1, j+1, k+1)]
+                    n8 = node_map[(i, j+1, k+1)]
+                    material_id = material_volume[i, j, k]
+                    elements.append([elem_id, n1, n2, n3, n4, n5, n6, n7, n8, material_id])
+                    elem_id += 1
+
+    # Write optimized CAE-compatible INP file
+        cae_path = os.path.join(abaqus_dir, f"{sample_name}_cae_small.inp")
+        self.write_optimized_cae_inp(cae_path, nodes, elements, material_volume)
+
+    # Check file size
+        file_size_mb = os.path.getsize(cae_path) / (1024 * 1024)
+        print(f"✅ CAE file saved: {cae_path} ({file_size_mb:.1f} MB)")
+
+        if file_size_mb > 5:
+            print("⚠️  File size exceeds 5MB, creating even smaller version...")
+            return self.create_extra_small_cae(volume, sample_name)
+
+        return cae_path
+
+    def write_optimized_cae_inp(self, file_path, nodes, elements, material_volume):
+        """Write optimized INP file for CAE with proper formatting"""
+        material_names = ['SILICATES', 'CARBONATE', 'OTHERS', 'CLAY', 'KEROGEN']
+
+        with open(file_path, 'w') as f:
+            # Write header with proper formatting
+            f.write("*HEADING\n")
+            f.write("3D Shale Microstructure - Natural Mineral Distribution\n")
+            f.write("** Generated by AdvancedShaleReconstructor3D\n")
+            f.write("** Optimized for Abaqus CAE import\n")
+            f.write("**\n")
+
+            # Write nodes section
+            f.write("*NODE\n")
+            for node in nodes:
+                f.write(f"{node[0]}, {node[1]}, {node[2]}, {node[3]}\n")
+
+            # Write elements with proper element type
+            f.write("*ELEMENT, TYPE=C3D8R\n")
+            for elem in elements:
+                elem_line = f"{elem[0]}, {elem[1]}, {elem[2]}, {elem[3]}, {elem[4]}, {elem[5]}, {elem[6]}, {elem[7]}, {elem[8]}"
+                f.write(elem_line + "\n")
+
+            # Write element sets with proper formatting
+            for mat_id, mat_name in enumerate(material_names):
+                actual_mat_id = mat_id + 1
+                f.write(f"*ELSET, ELSET={mat_name}_ELEMENTS\n")
+                mat_elements = [str(e[0]) for e in elements if e[9] == actual_mat_id]
+
+                # Write in chunks of 16 for better readability
+                for i in range(0, len(mat_elements), 16):
+                    chunk = mat_elements[i:i+16]
+                    f.write(", ".join(chunk) + "\n")
+
+            # Write material sections
+            for mat_name in material_names:
+                f.write(f"*SOLID SECTION, ELSET={mat_name}_ELEMENTS, MATERIAL={mat_name}\n")
+                f.write("1.,\n")
+
+            f.write("**END\n")
+
+    def create_extra_small_cae(self, volume, sample_name):
+        """Create extra small version (16x16x16) for guaranteed <5MB"""
+        print("🔩 Creating extra small version (16x16x16)...")
+
+        abaqus_dir = os.path.join(self.base_path, 'Output/Abaqus')
+        os.makedirs(abaqus_dir, exist_ok=True)
+
+    # Force 16x16x16 size
+        target_size = (16, 16, 16)
+        volume_downsampled = ndimage.zoom(volume,[target_size[i]/volume.shape[i] for i in range(3)],
+                                order=0)
+
+    # Assign material phases
+        thresholds = np.percentile(volume_downsampled, [20, 40, 60, 80])
+        material_volume = np.zeros_like(volume_downsampled, dtype=np.int8)
+
+        material_volume[volume_downsampled < thresholds[0]] = 5  # Kerogen
+        material_volume[(volume_downsampled >= thresholds[0]) & (volume_downsampled < thresholds[1])] = 4  # Clay
+        material_volume[(volume_downsampled >= thresholds[1]) & (volume_downsampled < thresholds[2])] = 3  # Others
+        material_volume[(volume_downsampled >= thresholds[2]) & (volume_downsampled < thresholds[3])] = 2  # Carbonate
+        material_volume[volume_downsampled >= thresholds[3]] = 1  # Silicates
+
+    # Create simplified mesh
+        nx, ny, nz = material_volume.shape
+        nodes = []
+        node_id = 1
+        node_map = {}
+
+    # Create nodes with integer coordinates to reduce file size
+        for i in range(nx + 1):
+            for j in range(ny + 1):
+                for k in range(nz + 1):
+                    nodes.append([node_id, i, j, k])  # Integer coordinates
+                    node_map[(i, j, k)] = node_id
+                    node_id += 1
+
+        elements = []
+        elem_id = 1
+
+    # Create hexahedral elements
+        for i in range(nx):
+            for j in range(ny):
+                for k in range(nz):
+                    n1 = node_map[(i, j, k)]
+                    n2 = node_map[(i+1, j, k)]
+                    n3 = node_map[(i+1, j+1, k)]
+                    n4 = node_map[(i, j+1, k)]
+                    n5 = node_map[(i, j, k+1)]
+                    n6 = node_map[(i+1, j, k+1)]
+                    n7 = node_map[(i+1, j+1, k+1)]
+                    n8 = node_map[(i, j+1, k+1)]
+                    material_id = material_volume[i, j, k]
+                    elements.append([elem_id, n1, n2, n3, n4, n5, n6, n7, n8, material_id])
+                    elem_id += 1
+
+    # Write optimized CAE-compatible INP file
+        cae_path = os.path.join(abaqus_dir, f"{sample_name}_cae_extra_small.inp")
+        self.write_optimized_cae_inp(cae_path, nodes, elements, material_volume)  # ADD THIS LINE
+
+        file_size_mb = os.path.getsize(cae_path) / (1024 * 1024)
+        print(f"✅ Extra small CAE file saved: {cae_path} ({file_size_mb:.1f} MB)")
+        return cae_path
+
+
+# --------- ComprehensiveVisualizer (kept)
+class ComprehensiveVisualizer:
+    """Create comprehensive visualizations of results"""
+
+    def __init__(self, base_path):
+        self.base_path = base_path
+        self.output_dir = os.path.join(base_path, 'Output')
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def create_3d_volume_visualization(self, volume, sample_name):
+        """Create colorful 3D visualization with mineral phase colors"""
+        try:
+            # Create labeled volume for mineral phases
+            thresholds = np.percentile(volume, [20, 40, 60, 80])
+            labeled_volume = np.zeros_like(volume, dtype=int)
+            labeled_volume[volume < thresholds[0]] = 4  # Kerogen
+            labeled_volume[(volume >= thresholds[0]) & (volume < thresholds[1])] = 3  # Clay
+            labeled_volume[(volume >= thresholds[1]) & (volume < thresholds[2])] = 2  # Others
+            labeled_volume[(volume >= thresholds[2]) & (volume < thresholds[3])] = 1  # Carbonate
+            labeled_volume[volume >= thresholds[3]] = 0  # Silicates
+
+            # Create mineral palette
+            palette = MineralPalette(self.base_path)
+            palette.try_extract_from_folder(sample_name)
+
+            # Create colorful volume
+            colorful_volume = np.zeros(volume.shape + (3,), dtype=np.float32)
+            for phase_id in range(5):
+                mask = labeled_volume == phase_id
+                phase_name = palette.I2P[phase_id]
+                color = palette.palette[phase_name]
+                colorful_volume[mask] = color
+
+            # Create 3 subplots: XY, XZ, YZ slices with colors
+            fig = plt.figure(figsize=(18, 6))
+
+            # XY slice (middle)
+            ax1 = fig.add_subplot(131)
+            xy_slice = colorful_volume[:, :, volume.shape[2]//2]
+            ax1.imshow(xy_slice)
+            ax1.set_title(f'XY Slice - {sample_name}', fontsize=12, fontweight='bold')
+            ax1.set_xlabel('X (voxels)'); ax1.set_ylabel('Y (voxels)')
+            ax1.grid(False)
+
+            # XZ slice (middle)
+            ax2 = fig.add_subplot(132)
+            xz_slice = colorful_volume[:, volume.shape[1]//2, :]
+            ax2.imshow(xz_slice)
+            ax2.set_title(f'XZ Slice - {sample_name}', fontsize=12, fontweight='bold')
+            ax2.set_xlabel('Z (voxels)'); ax2.set_ylabel('X (voxels)')
+            ax2.grid(False)
+
+            # YZ slice (middle)
+            ax3 = fig.add_subplot(133)
+            yz_slice = colorful_volume[volume.shape[0]//2, :, :]
+            ax3.imshow(yz_slice)
+            ax3.set_title(f'YZ Slice - {sample_name}', fontsize=12, fontweight='bold')
+            ax3.set_xlabel('Z (voxels)'); ax3.set_ylabel('Y (voxels)')
+            ax3.grid(False)
+
+            # Add legend
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor=palette.palette['Silicates'], label='Silicates (Quartz/Feldspar)'),
+                Patch(facecolor=palette.palette['Carbonate'], label='Carbonate (Calcite/Dolomite)'),
+                Patch(facecolor=palette.palette['Clay'], label='Clay Minerals'),
+                Patch(facecolor=palette.palette['Kerogen'], label='Kerogen/Organic'),
+                Patch(facecolor=palette.palette['Others'], label='Others (Pyrite/etc)')
+            ]
+            fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, 0.05),
+                      ncol=3, fontsize=10, framealpha=0.9)
+
+            plt.tight_layout()
+            output_path = os.path.join(self.output_dir, f'{sample_name}_3d_mineral_slices.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ Colorful 3D mineral slices saved: {output_path}")
+
+            # Also create a 3D scatter plot for better visualization
+            self.create_enhanced_3d_scatter(volume, labeled_volume, sample_name, palette)
+
+        except Exception as e:
+            print(f"⚠️  Enhanced 3D visualization failed: {e}")
+            self.create_3d_scatter_visualization(volume, sample_name)
+
+    def create_enhanced_3d_scatter(self, volume, labeled_volume, sample_name, palette):
+        """Create enhanced 3D scatter plot with mineral colors"""
+        try:
+            # Sample points for visualization (every 4th voxel to reduce density)
+            sample_mask = (np.arange(volume.size) % 4 == 0)
+            x, y, z = np.meshgrid(np.arange(volume.shape[0]),
+                                 np.arange(volume.shape[1]),
+                                 np.arange(volume.shape[2]), indexing='ij')
+
+            x_sample = x.ravel()[sample_mask]
+            y_sample = y.ravel()[sample_mask]
+            z_sample = z.ravel()[sample_mask]
+            labels_sample = labeled_volume.ravel()[sample_mask]
+
+            # Create figure
+            fig = plt.figure(figsize=(15, 12))
+            ax = fig.add_subplot(111, projection='3d')
+
+            # Plot each phase with its color
+            for phase_id in range(5):
+                phase_mask = labels_sample == phase_id
+                if np.sum(phase_mask) > 0:  # Only plot if phase exists
+                    phase_name = palette.I2P[phase_id]
+                    color = palette.palette[phase_name]
+                    ax.scatter(x_sample[phase_mask], y_sample[phase_mask], z_sample[phase_mask],
+                              c=[color], s=1, alpha=0.6, label=phase_name, depthshade=False)
+
+            ax.set_xlabel('X (voxels)'); ax.set_ylabel('Y (voxels)'); ax.set_zlabel('Z (voxels)')
+            ax.set_title(f'3D Mineral Distribution - {sample_name}\n({volume.shape[0]}×{volume.shape[1]}×{volume.shape[2]} voxels)',
+                        fontsize=14, fontweight='bold')
+
+            # Add legend
+            ax.legend(loc='upper left', bbox_to_anchor=(0, 1), fontsize=10)
+
+            # Set equal aspect ratio
+            max_range = max(volume.shape)
+            ax.set_xlim(0, max_range); ax.set_ylim(0, max_range); ax.set_zlim(0, max_range)
+
+            plt.tight_layout()
+            output_path = os.path.join(self.output_dir, f'{sample_name}_3d_mineral_scatter.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ Enhanced 3D mineral scatter saved: {output_path}")
+
+        except Exception as e:
+            print(f"⚠️  Enhanced 3D scatter failed: {e}")
+    def create_realistic_shale_visualization(self, volume, sample_name):
+        """Create comprehensive visualization of realistic shale model"""
+        try:
+            # Create mineral-colored volume
+            thresholds = np.percentile(volume, [20, 40, 60, 80])
+            labeled_volume = np.zeros_like(volume, dtype=int)
+            labeled_volume[volume < thresholds[0]] = 4  # Kerogen
+            labeled_volume[(volume >= thresholds[0]) & (volume < thresholds[1])] = 3  # Clay
+            labeled_volume[(volume >= thresholds[1]) & (volume < thresholds[2])] = 2  # Others
+            labeled_volume[(volume >= thresholds[2]) & (volume < thresholds[3])] = 1  # Carbonate
+            labeled_volume[volume >= thresholds[3]] = 0  # Silicates
+
+            palette = MineralPalette(self.base_path)
+            palette.try_extract_from_folder(sample_name)
+
+            # Create colorful volume
+            colorful_volume = np.zeros(volume.shape + (3,), dtype=np.float32)
+            for phase_id in range(5):
+                mask = labeled_volume == phase_id
+                phase_name = palette.I2P[phase_id]
+                color = palette.palette[phase_name]
+                colorful_volume[mask] = color
+
+            # Create comprehensive visualization
+            fig = plt.figure(figsize=(20, 16))
+
+            # 3D subplot
+            ax1 = fig.add_subplot(231, projection='3d')
+            self._plot_3d_mineral_distribution(ax1, labeled_volume, palette, sample_name)
+
+            # XY slice
+            ax2 = fig.add_subplot(232)
+            xy_slice = colorful_volume[:, :, volume.shape[2]//2]
+            ax2.imshow(xy_slice)
+            ax2.set_title('XY Slice - Horizontal Bedding', fontweight='bold')
+            ax2.set_xlabel('X'); ax2.set_ylabel('Y')
+
+            # XZ slice
+            ax3 = fig.add_subplot(233)
+            xz_slice = colorful_volume[:, volume.shape[1]//2, :]
+            ax3.imshow(xz_slice)
+            ax3.set_title('XZ Slice - Vertical Profile', fontweight='bold')
+            ax3.set_xlabel('Z'); ax3.set_ylabel('X')
+
+            # YZ slice
+            ax4 = fig.add_subplot(234)
+            yz_slice = colorful_volume[volume.shape[0]//2, :, :]
+            ax4.imshow(yz_slice)
+            ax4.set_title('YZ Slice - Vertical Profile', fontweight='bold')
+            ax4.set_xlabel('Z'); ax4.set_ylabel('Y')
+
+            # Original intensity slices
+            ax5 = fig.add_subplot(235)
+            ax5.imshow(volume[:, :, volume.shape[2]//2], cmap='gray')
+            ax5.set_title('Grayscale XY Slice', fontweight='bold')
+
+            # Composition bar chart
+            ax6 = fig.add_subplot(236)
+            composition = self._calculate_volume_composition(labeled_volume)
+            phases = list(composition.keys())
+            percentages = list(composition.values())
+            bars = ax6.bar(phases, percentages, color=[palette.palette[p] for p in phases])
+            ax6.set_title('Mineral Composition', fontweight='bold')
+            ax6.set_ylabel('Volume Percentage (%)')
+            plt.setp(ax6.xaxis.get_majorticklabels(), rotation=45)
+
+            # Add value labels on bars
+            for bar, percentage in zip(bars, percentages):
+                height = bar.get_height()
+                ax6.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{percentage:.1f}%', ha='center', va='bottom', fontweight='bold')
+
+            plt.suptitle(f'Realistic 3D Shale Model - {sample_name}\n'
+                        f'Dimensions: {volume.shape[0]}×{volume.shape[1]}×{volume.shape[2]} voxels',
+                        fontsize=16, fontweight='bold')
+
+            plt.tight_layout()
+            output_path = os.path.join(self.output_dir, f'{sample_name}_realistic_shale_comprehensive.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ Realistic shale visualization saved: {output_path}")
+
+        except Exception as e:
+            print(f"⚠️  Realistic shale visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
+    def create_enhanced_model_comparison_visualization(self, scattered_vol, continuous_vol, realistic_vol, complete_continuous_vol,
+                                                     sample_name, target_comp,
+                                                     comp_scattered, comp_continuous, comp_realistic, comp_complete_continuous):
+        """Create comprehensive comparison of all four models"""
+        try:
+            fig = plt.figure(figsize=(24, 18))
+            fig.suptitle(f'4-Model Comparison - {sample_name}\nScattered vs Continuous vs Realistic vs Complete Continuous',
+                        fontsize=18, fontweight='bold')
+
+            models = ['Scattered', 'Continuous', 'Realistic', 'Complete Continuous']
+            volumes = [scattered_vol, continuous_vol, realistic_vol, complete_continuous_vol]
+            compositions = [comp_scattered, comp_continuous, comp_realistic, comp_complete_continuous]
+            colors = ['blue', 'green', 'red', 'purple']
+
+            # Create 4x4 grid for comprehensive comparison
+            for i, (model, vol, comp, color) in enumerate(zip(models, volumes, compositions, colors)):
+                row = i
+
+                # XY slice
+                ax1 = fig.add_subplot(4, 4, row*4 + 1)
+                ax1.imshow(vol[:, :, vol.shape[2]//2], cmap='gray')
+                ax1.set_title(f'{model}\nXY Slice', fontweight='bold')
+                if row == 0:
+                    ax1.set_ylabel('Y voxels')
+                if row == 3:
+                    ax1.set_xlabel('X voxels')
+                similarity = CompositionTools.similarity_score(comp, target_comp)
+                ax1.text(0.05, 0.95, f'Sim: {similarity:.3f}',
+                        transform=ax1.transAxes, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                        fontweight='bold')
+
+                # XZ slice
+                ax2 = fig.add_subplot(4, 4, row*4 + 2)
+                ax2.imshow(vol[:, vol.shape[1]//2, :], cmap='gray')
+                ax2.set_title(f'{model}\nXZ Slice', fontweight='bold')
+                if row == 0:
+                    ax2.set_ylabel('X voxels')
+                if row == 3:
+                    ax2.set_xlabel('Z voxels')
+
+            # Composition comparison (bottom row)
+            ax_comp = fig.add_subplot(4, 4, (13, 14))
+            phases = list(target_comp.keys())
+            target_vals = [target_comp[p] for p in phases]
+
+            x = np.arange(len(phases))
+            width = 0.15
+
+            ax_comp.bar(x - width*1.5, target_vals, width, label='Target', alpha=0.8, color='black')
+            for i, (comp, color, model) in enumerate(zip(compositions, colors, models)):
+                comp_vals = [comp.get(p, 0) for p in phases]
+                ax_comp.bar(x - width*0.5 + i*width, comp_vals, width, label=model, alpha=0.8, color=color)
+
+            ax_comp.set_xlabel('Mineral Phases')
+            ax_comp.set_ylabel('Volume Percentage (%)')
+            ax_comp.set_title('Composition Comparison', fontweight='bold')
+            ax_comp.set_xticks(x)
+            ax_comp.set_xticklabels(phases, rotation=45)
+            ax_comp.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax_comp.grid(True, alpha=0.3)
+
+            # Quality metrics comparison
+            ax_metrics = fig.add_subplot(4, 4, (15, 16))
+            metrics_data = []
+
+            for i, (model, vol) in enumerate(zip(models, volumes)):
+                intensity_std = np.std(vol)
+                moran_i = morans_I(vol)
+                porosity = np.mean(vol < 0.5)
+
+                metrics_data.append({
+                    'Model': model,
+                    'Intensity Std': intensity_std,
+                    "Moran's I": moran_i,
+                    'Porosity': porosity
+                })
+
+            metrics_df = pd.DataFrame(metrics_data)
+            x_metrics = np.arange(len(models))
+            metrics = ['Intensity Std', "Moran's I", 'Porosity']
+
+            for i, metric in enumerate(metrics):
+                values = metrics_df[metric].values
+                ax_metrics.bar(x_metrics + i*0.2, values, 0.2, label=metric, alpha=0.8)
+
+            ax_metrics.set_xlabel('Models')
+            ax_metrics.set_ylabel('Metric Values')
+            ax_metrics.set_title('Quality Metrics Comparison', fontweight='bold')
+            ax_metrics.set_xticks(x_metrics + 0.2)
+            ax_metrics.set_xticklabels(models, rotation=45)
+            ax_metrics.legend()
+            ax_metrics.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            output_path = os.path.join(self.output_dir, f'{sample_name}_4model_comparison.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ 4-Model comparison saved: {output_path}")
+
+        except Exception as e:
+            print(f"⚠️  4-Model comparison visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _plot_3d_mineral_distribution(self, ax, labeled_volume, palette, sample_name):
+        """Create 3D mineral distribution plot"""
+        try:
+            # Sample every 4th voxel for performance
+            sample_mask = (np.arange(labeled_volume.size) % 8 == 0)
+            x, y, z = np.meshgrid(np.arange(labeled_volume.shape[0]),
+                                 np.arange(labeled_volume.shape[1]),
+                                 np.arange(labeled_volume.shape[2]), indexing='ij')
+
+            x_sample = x.ravel()[sample_mask]
+            y_sample = y.ravel()[sample_mask]
+            z_sample = z.ravel()[sample_mask]
+            labels_sample = labeled_volume.ravel()[sample_mask]
+
+            # Plot each mineral phase
+            for phase_id in range(5):
+                phase_mask = labels_sample == phase_id
+                if np.sum(phase_mask) > 0:
+                    phase_name = palette.I2P[phase_id]
+                    color = palette.palette[phase_name]
+                    ax.scatter(x_sample[phase_mask], y_sample[phase_mask], z_sample[phase_mask],
+                              c=[color], s=2, alpha=0.6, label=phase_name, depthshade=False)
+
+            ax.set_xlabel('X (voxels)'); ax.set_ylabel('Y (voxels)'); ax.set_zlabel('Z (voxels)')
+            ax.set_title('3D Mineral Distribution', fontweight='bold')
+            ax.legend(loc='upper left', bbox_to_anchor=(0, 1))
+
+        except Exception as e:
+            print(f"⚠️  3D mineral distribution plot failed: {e}")
+            # Fallback: create a simple 3D plot
+            ax.text(0.5, 0.5, 0.5, '3D Visualization\nNot Available',
+                    transform=ax.transAxes, ha='center', va='center', fontsize=12)
+
+    def _calculate_volume_composition(self, labeled_volume):
+        """Calculate mineral composition from labeled volume"""
+        total_voxels = labeled_volume.size
+        composition = {}
+
+        for phase_id in range(5):
+            phase_name = ['Silicates', 'Carbonate', 'Others', 'Clay', 'Kerogen'][phase_id]
+            percentage = (np.sum(labeled_volume == phase_id) / total_voxels) * 100
+            composition[phase_name] = percentage
+
+        return composition
+
+    def create_slice_comparison(self, original_patches, generated_volume, sample_name):
+        """Create enhanced slice comparison with mineral colors"""
+        # Create mineral-colored 3D slices
+        thresholds = np.percentile(generated_volume, [20, 40, 60, 80])
+        labeled_volume = np.zeros_like(generated_volume, dtype=int)
+        labeled_volume[generated_volume < thresholds[0]] = 4
+        labeled_volume[(generated_volume >= thresholds[0]) & (generated_volume < thresholds[1])] = 3
+        labeled_volume[(generated_volume >= thresholds[1]) & (generated_volume < thresholds[2])] = 2
+        labeled_volume[(generated_volume >= thresholds[2]) & (generated_volume < thresholds[3])] = 1
+        labeled_volume[generated_volume >= thresholds[3]] = 0
+
+        palette = MineralPalette(self.base_path)
+        palette.try_extract_from_folder(sample_name)
+
+        colorful_volume = np.zeros(generated_volume.shape + (3,), dtype=np.float32)
+        for phase_id in range(5):
+            mask = labeled_volume == phase_id
+            phase_name = palette.I2P[phase_id]
+            color = palette.palette[phase_name]
+            colorful_volume[mask] = color
+
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+        fig.suptitle(f'2D-3D Mineral Comparison - {sample_name}', fontsize=16, fontweight='bold')
+
+        # Original SEM patches (grayscale)
+        for i in range(4):
+            axes[0, i].imshow(original_patches[i], cmap='gray')
+            axes[0, i].set_title(f'Original SEM {i+1}'); axes[0, i].axis('off')
+
+        # Generated 3D slices (colorful)
+        slice_indices = [0, generated_volume.shape[2]//3, 2*generated_volume.shape[2]//3, generated_volume.shape[2]-1]
+        for i, idx in enumerate(slice_indices):
+            axes[1, i].imshow(colorful_volume[:, :, idx])
+            axes[1, i].set_title(f'3D Mineral Slice Z={idx}'); axes[1, i].axis('off')
+
+        # Add color legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=palette.palette['Silicates'], label='Silicates'),
+            Patch(facecolor=palette.palette['Carbonate'], label='Carbonate'),
+            Patch(facecolor=palette.palette['Clay'], label='Clay'),
+            Patch(facecolor=palette.palette['Kerogen'], label='Kerogen'),
+            Patch(facecolor=palette.palette['Others'], label='Others')
+        ]
+        fig.legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.05),
+                  ncol=5, fontsize=12, framealpha=0.9)
+
+        plt.tight_layout()
+        output_path = os.path.join(self.output_dir, f'{sample_name}_mineral_comparison.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Enhanced mineral comparison saved: {output_path}")
+
+    def create_composition_analysis(self, target_comp, volume_comp, sample_name):
+        phases = list(target_comp.keys())
+        target_vals = [target_comp[p] for p in phases]
+        volume_vals = [volume_comp.get(p, 0) for p in phases]
+        x = np.arange(len(phases)); width = 0.35
+        fig, ax = plt.subplots(figsize=(12, 8))
+        bars1 = ax.bar(x - width/2, target_vals, width, label='Target (SEM+Excel)',
+                       alpha=0.7, color='navy', edgecolor='black')
+        bars2 = ax.bar(x + width/2, volume_vals, width, label='Generated (3D Model)',
+                       alpha=0.7, color='crimson', edgecolor='black')
+        ax.set_xlabel('Mineral Phases', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Volume Percentage (%)', fontsize=12, fontweight='bold')
+        ax.set_title(f'Mineral Composition Matching - {sample_name}', fontsize=14, fontweight='bold')
+        ax.set_xticks(x); ax.set_xticklabels(phases, rotation=45, ha='right')
+        ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                ax.annotate(f'{height:.1f}%',
+                            xy=(bar.get_x() + bar.get_width() / 2, height),
+                            xytext=(0, 3), textcoords="offset points",
+                            ha='center', va='bottom', fontsize=9, fontweight='bold')
+        similarity = 1 - np.mean(np.abs(np.array(target_vals) - np.array(volume_vals)) / 100.0)
+        ax.text(0.02, 0.98, f'Composition Similarity: {similarity:.3f}',
+                transform=ax.transAxes, fontsize=12, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+        plt.tight_layout()
+        output_path = os.path.join(self.output_dir, f'{sample_name}_composition_analysis.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight'); plt.close()
+        print(f"✅ Composition analysis saved: {output_path}")
+        return similarity
+    def create_model_comparison_visualization(self, scattered_vol, continuous_vol, realistic_vol,
+                                            sample_name, target_comp,
+                                            comp_scattered, comp_continuous, comp_realistic):
+        """Create comprehensive comparison of all three models"""
+        try:
+            fig = plt.figure(figsize=(20, 15))
+            fig.suptitle(f'3D Model Comparison - {sample_name}\nScattered vs Continuous vs Realistic Approaches',
+                        fontsize=16, fontweight='bold')
+
+            # Model 1: Scattered - XY slice
+            ax1 = fig.add_subplot(3, 4, 1)
+            ax1.imshow(scattered_vol[:, :, scattered_vol.shape[2]//2], cmap='gray')
+            ax1.set_title('Scattered Model\nXY Slice', fontweight='bold')
+            ax1.set_ylabel('Y voxels')
+            ax1.text(0.05, 0.95, f'Similarity: {CompositionTools.similarity_score(comp_scattered, target_comp):.3f}',
+                    transform=ax1.transAxes, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                    fontweight='bold')
+
+            # Model 1: Scattered - XZ slice
+            ax2 = fig.add_subplot(3, 4, 2)
+            ax2.imshow(scattered_vol[:, scattered_vol.shape[1]//2, :], cmap='gray')
+            ax2.set_title('Scattered Model\nXZ Slice', fontweight='bold')
+            ax2.set_ylabel('X voxels')
+
+            # Model 2: Continuous - XY slice
+            ax3 = fig.add_subplot(3, 4, 5)
+            ax3.imshow(continuous_vol[:, :, continuous_vol.shape[2]//2], cmap='gray')
+            ax3.set_title('Continuous Model\nXY Slice', fontweight='bold')
+            ax3.set_ylabel('Y voxels')
+            ax3.text(0.05, 0.95, f'Similarity: {CompositionTools.similarity_score(comp_continuous, target_comp):.3f}',
+                    transform=ax3.transAxes, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                    fontweight='bold')
+
+            # Model 2: Continuous - XZ slice
+            ax4 = fig.add_subplot(3, 4, 6)
+            ax4.imshow(continuous_vol[:, continuous_vol.shape[1]//2, :], cmap='gray')
+            ax4.set_title('Continuous Model\nXZ Slice', fontweight='bold')
+            ax4.set_ylabel('X voxels')
+
+            # Model 3: Realistic - XY slice
+            ax5 = fig.add_subplot(3, 4, 9)
+            ax5.imshow(realistic_vol[:, :, realistic_vol.shape[2]//2], cmap='gray')
+            ax5.set_title('Realistic Model\nXY Slice', fontweight='bold')
+            ax5.set_ylabel('Y voxels')
+            ax5.set_xlabel('X voxels')
+            ax5.text(0.05, 0.95, f'Similarity: {CompositionTools.similarity_score(comp_realistic, target_comp):.3f}',
+                    transform=ax5.transAxes, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                    fontweight='bold')
+
+            # Model 3: Realistic - XZ slice
+            ax6 = fig.add_subplot(3, 4, 10)
+            ax6.imshow(realistic_vol[:, realistic_vol.shape[1]//2, :], cmap='gray')
+            ax6.set_title('Realistic Model\nXZ Slice', fontweight='bold')
+            ax6.set_ylabel('X voxels')
+            ax6.set_xlabel('Z voxels')
+
+            # Composition comparison
+            ax7 = fig.add_subplot(3, 4, 7)
+            phases = list(target_comp.keys())
+            target_vals = [target_comp[p] for p in phases]
+            scattered_vals = [comp_scattered.get(p, 0) for p in phases]
+            continuous_vals = [comp_continuous.get(p, 0) for p in phases]
+            realistic_vals = [comp_realistic.get(p, 0) for p in phases]
+
+            x = np.arange(len(phases))
+            width = 0.2
+
+            ax7.bar(x - width*1.5, target_vals, width, label='Target', alpha=0.8, color='black')
+            ax7.bar(x - width*0.5, scattered_vals, width, label='Scattered', alpha=0.8, color='blue')
+            ax7.bar(x + width*0.5, continuous_vals, width, label='Continuous', alpha=0.8, color='green')
+            ax7.bar(x + width*1.5, realistic_vals, width, label='Realistic', alpha=0.8, color='red')
+
+            ax7.set_xlabel('Mineral Phases')
+            ax7.set_ylabel('Volume Percentage (%)')
+            ax7.set_title('Composition Comparison Across Models', fontweight='bold')
+            ax7.set_xticks(x)
+            ax7.set_xticklabels(phases, rotation=45)
+            ax7.legend()
+            ax7.grid(True, alpha=0.3)
+
+            # Quality metrics comparison
+
+            ax8 = fig.add_subplot(3, 4, 8)
+            ax9 = fig.add_subplot(3, 4, 11)
+            ax10 = fig.add_subplot(3, 4, 12)
+            models = ['Scattered', 'Continuous', 'Realistic']
+            volumes = [scattered_vol, continuous_vol, realistic_vol]
+
+            metrics_data = []
+            for i, (model, vol) in enumerate(zip(models, volumes)):
+                intensity_std = np.std(vol)
+                moran_i = morans_I(vol)
+                porosity = np.mean(vol < 0.5)
+
+                metrics_data.append({
+                    'Model': model,
+                    'Intensity Std': intensity_std,
+                    "Moran's I": moran_i,
+                    'Porosity': porosity
+                })
+
+            metrics_df = pd.DataFrame(metrics_data)
+            x_metrics = np.arange(len(models))
+            metrics = ['Intensity Std', "Moran's I", 'Porosity']
+            axes = [ax7, ax8, ax9]
+
+            for i, (metric, ax) in enumerate(zip(metrics, axes)):
+                values = metrics_df[metric].values
+                bars = ax.bar(models, values, alpha=0.8, color=['skyblue', 'lightgreen', 'lightcoral'][i])
+                ax.set_title(f'{metric}')
+                ax.set_ylabel(metric)
+                ax.grid(True, alpha=0.3)
+
+                # Add value labels on bars
+                for bar, value in zip(bars, values):
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                            f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
+
+            # Use ax10 for a summary or leave empty
+            ax10.text(0.5, 0.5, 'Quality Metrics\nComparison',
+                      transform=ax10.transAxes, ha='center', va='center', fontsize=12, fontweight='bold')
+            ax10.axis('off')
+            colors = ['skyblue', 'lightgreen', 'lightcoral']
+
+            for i, metric in enumerate(metrics):
+                values = metrics_df[metric].values
+                ax8.bar(x_metrics + i*0.25, values, 0.25, label=metric, alpha=0.8, color=colors[i])
+
+            ax8.set_xlabel('Models')
+            ax8.set_ylabel('Metric Values')
+            ax8.set_title('Quality Metrics Comparison', fontweight='bold')
+            ax8.set_xticks(x_metrics + 0.25)
+            ax8.set_xticklabels(models)
+            ax8.legend()
+            ax8.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            output_path = os.path.join(self.output_dir, f'{sample_name}_model_comparison.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ Model comparison saved: {output_path}")
+
+        except Exception as e:
+            print(f"⚠️  Model comparison visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
+    def create_enhanced_model_comparison_visualization(self, scattered_vol, continuous_vol, realistic_vol, complete_continuous_vol,
+                                                     sample_name, target_comp,
+                                                     comp_scattered, comp_continuous, comp_realistic, comp_complete_continuous):
+        """Create comprehensive comparison of all four models"""
+        try:
+            fig = plt.figure(figsize=(24, 18))
+            fig.suptitle(f'4-Model Comparison - {sample_name}\nScattered vs Continuous vs Realistic vs Complete Continuous',
+                        fontsize=18, fontweight='bold')
+
+            models = ['Scattered', 'Continuous', 'Realistic', 'Complete Continuous']
+            volumes = [scattered_vol, continuous_vol, realistic_vol, complete_continuous_vol]
+            compositions = [comp_scattered, comp_continuous, comp_realistic, comp_complete_continuous]
+            colors = ['blue', 'green', 'red', 'purple']
+
+            # Create 4x4 grid for comprehensive comparison
+            for i, (model, vol, comp, color) in enumerate(zip(models, volumes, compositions, colors)):
+                row = i
+
+                # XY slice
+                ax1 = fig.add_subplot(4, 4, row*4 + 1)
+                ax1.imshow(vol[:, :, vol.shape[2]//2], cmap='gray')
+                ax1.set_title(f'{model}\nXY Slice', fontweight='bold')
+                if row == 0:
+                    ax1.set_ylabel('Y voxels')
+                if row == 3:
+                    ax1.set_xlabel('X voxels')
+                similarity = CompositionTools.similarity_score(comp, target_comp)
+                ax1.text(0.05, 0.95, f'Sim: {similarity:.3f}',
+                        transform=ax1.transAxes, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                        fontweight='bold')
+
+                # XZ slice
+                ax2 = fig.add_subplot(4, 4, row*4 + 2)
+                ax2.imshow(vol[:, vol.shape[1]//2, :], cmap='gray')
+                ax2.set_title(f'{model}\nXZ Slice', fontweight='bold')
+                if row == 0:
+                    ax2.set_ylabel('X voxels')
+                if row == 3:
+                    ax2.set_xlabel('Z voxels')
+
+            # Composition comparison (bottom row)
+            ax_comp = fig.add_subplot(4, 4, (13, 14))
+            phases = list(target_comp.keys())
+            target_vals = [target_comp[p] for p in phases]
+
+            x = np.arange(len(phases))
+            width = 0.15
+
+            ax_comp.bar(x - width*1.5, target_vals, width, label='Target', alpha=0.8, color='black')
+            for i, (comp, color, model) in enumerate(zip(compositions, colors, models)):
+                comp_vals = [comp.get(p, 0) for p in phases]
+                ax_comp.bar(x - width*0.5 + i*width, comp_vals, width, label=model, alpha=0.8, color=color)
+
+            ax_comp.set_xlabel('Mineral Phases')
+            ax_comp.set_ylabel('Volume Percentage (%)')
+            ax_comp.set_title('Composition Comparison', fontweight='bold')
+            ax_comp.set_xticks(x)
+            ax_comp.set_xticklabels(phases, rotation=45)
+            ax_comp.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax_comp.grid(True, alpha=0.3)
+
+            # Quality metrics comparison
+            ax_metrics = fig.add_subplot(4, 4, (15, 16))
+            metrics_data = []
+
+            for i, (model, vol) in enumerate(zip(models, volumes)):
+                intensity_std = np.std(vol)
+                moran_i = morans_I(vol)
+                porosity = np.mean(vol < 0.5)
+
+                metrics_data.append({
+                    'Model': model,
+                    'Intensity Std': intensity_std,
+                    "Moran's I": moran_i,
+                    'Porosity': porosity
+                })
+
+            metrics_df = pd.DataFrame(metrics_data)
+            x_metrics = np.arange(len(models))
+            metrics = ['Intensity Std', "Moran's I", 'Porosity']
+
+            for i, metric in enumerate(metrics):
+                values = metrics_df[metric].values
+                ax_metrics.bar(x_metrics + i*0.2, values, 0.2, label=metric, alpha=0.8)
+
+            ax_metrics.set_xlabel('Models')
+            ax_metrics.set_ylabel('Metric Values')
+            ax_metrics.set_title('Quality Metrics Comparison', fontweight='bold')
+            ax_metrics.set_xticks(x_metrics + 0.2)
+            ax_metrics.set_xticklabels(models, rotation=45)
+            ax_metrics.legend()
+            ax_metrics.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            output_path = os.path.join(self.output_dir, f'{sample_name}_4model_comparison.png')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print(f"✅ 4-Model comparison saved: {output_path}")
+
+        except Exception as e:
+            print(f"⚠️  4-Model comparison visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
+# =========================
+# SECTION 4 / 4
+# =========================
+    # ============== FEM Analysis Functions ==============
+class NumpyEncoder(json.JSONEncoder):
+    """Custom encoder for numpy data types"""
+    def default(self, obj):
+        if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
+                          np.int16, np.int32, np.int64, np.uint8,
+                          np.uint16, np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.float_, np.float16, np.float32,
+                            np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
+
+
+class FastShaleReconstructor3D:
+    """Main class for fast 3D shale reconstruction"""
+
+    def __init__(self, base_path, excel_path):
+        self.base_path = base_path
+        self.excel_path = excel_path
+        self.mineral_processor = AdvancedMineralProcessor(excel_path)
+        self.sem_processor = AdvancedSEMProcessor(base_path)
+        self.abaqus_exporter = AdvancedAbaqusExporter(self.mineral_processor)
+        self.visualizer = ComprehensiveVisualizer(base_path)
+        self.selector = CompositionGuidedSelector(self.mineral_processor)
+        self.mineral_processor.load_and_parse_excel()
+        self.create_output_directories()
+        print("🚀 Advanced Fast Shale Reconstructor 3D Initialized")
+        print("📊 Following exact methodology from paper")
+        print("⏱️  Optimized for 15-20 minute execution")
+
+    def create_output_directories(self):
+        directories = [
+            'Output/3D_Models', 'Output/Visualizations', 'Output/Abaqus',
+            'Output/Training_Data', 'Output/Quality_Metrics', 'Output/Colored', 'Output/TIFF_Stacks'
+        ]
+        for directory in directories:
+            full_path = os.path.join(self.base_path, directory)
+            os.makedirs(full_path, exist_ok=True)
+            print(f"📁 Created: {directory}")
+
+        # Create sample-specific subdirectories
+        sample_dirs = ['Training_Data', 'Quality_Metrics']
+        for sample_dir in sample_dirs:
+            sample_path = os.path.join(self.base_path, 'Output', sample_dir, 'sample1')
+            os.makedirs(sample_path, exist_ok=True)
+            sample_path = os.path.join(self.base_path, 'Output', sample_dir, 'sample6')
+            os.makedirs(sample_path, exist_ok=True)
+
+    def process_sample(self, sample_name, unet_epochs=40, slicegan_epochs=40):
+        print(f"\n🎯 PROCESSING SAMPLE: {sample_name}")
+        print("=" * 70)
+        start_time = pd.Timestamp.now()
+
+        # Step 1: Load SEM data
+        print("🔬 Step 1: Loading SEM images...")
+        sem_data = self.sem_processor.load_sample_images(sample_name)
+        if sem_data['mineral_map'] is None:
+            print("❌ No mineral map found, using enhanced BSE image")
+            if sem_data['bse'] is not None:
+                sem_data['mineral_map'] = self.sem_processor.enhance_image_quality(sem_data['bse'])
+            else:
+                print("❌ No SEM images found, creating synthetic data")
+                sem_data['mineral_map'] = self.create_realistic_sem_image()
+
+        # Step 2: Create training patches
+        print("✂️ Step 2: Creating training patches (10x10 grid)...")
+        patches, positions = self.create_10x10_patches(sem_data['mineral_map'])
+        self.patches = patches
+        if patches is None:
+            print("❌ Patch creation failed"); return None
+        print(f"✅ Created {len(patches)} patches for training")
+        # Step 3: Train Residual Attention U-Net with enhanced parameters
+        print("🧠 Step 3: Training Residual Attention U-Net (Enhanced)...")
+        unet = ResidualAttentionUNet(input_size=(64, 64, 1), num_classes=5)
+
+        # Enhanced training with better parameters
+        unet_history = unet.train_fast(
+            patches,
+            epochs=max(60, unet_epochs),  # Increased from 40 to 60
+            batch_size=8  # Reduced from 16 to 8 for better convergence
+        )
+
+        # Step 4: Segment patches (QC)
+        print("🎨 Step 4: Segmenting patches...")
+        segmented_patches = unet.segment_patches(patches)
+        # Step 5: Generate MULTIPLE 3D models for comparison
+        print("🏗️ Step 5: Generating multiple 3D models for comparison...")
+
+        # Get target composition
+        comp_data = self.mineral_processor.get_sample_composition(sample_name) or {}
+        target_composition = comp_data.get('five_phase_area', {
+            'Silicates': 70, 'Carbonate': 15, 'Clay': 10, 'Kerogen': 3, 'Others': 2
+        })
+
+        sem_reference = sem_data['mineral_map'] if sem_data['mineral_map'] is not None else sem_data['bse']
+
+        # Model 1: Original scattered approach
+        print("🔹 Model 1: Original scattered approach...")
+        assembler = MultiScaleVolumeAssembler(vol_size=128, patch_size=64, stride=32, smooth_sigma=0.8)
+        banks = assembler.make_banks(sem_reference)
+        scattered_vol = assembler.assemble(banks)
+
+        # Match intensity statistics to SEM
+        if sem_reference is not None:
+            ref = sem_reference.astype(np.float32)
+            if ref.max() > 2.0:
+                ref = ref / ref.max()
+            if ref.ndim == 3:
+                ref = np.mean(ref, axis=2)
+            ref_resized = cv2.resize(ref, (scattered_vol.shape[1], scattered_vol.shape[0]), interpolation=cv2.INTER_AREA)
+            for z in range(scattered_vol.shape[2]):
+                scattered_vol[:, :, z] = robust_minmax_match(scattered_vol[:, :, z], ref_resized)
+        scattered_vol = clip01(scattered_vol)
+
+        # Model 2: Original continuous approach
+        print("🔹 Model 2: Original continuous approach...")
+        continuous_assembler = MultiScaleVolumeAssembler(vol_size=128, patch_size=64, stride=16, smooth_sigma=1.2)
+        continuous_vol = continuous_assembler.assemble_continuous(banks)
+
+        # Match intensity statistics for continuous model
+        if sem_reference is not None:
+            for z in range(continuous_vol.shape[2]):
+                continuous_vol[:, :, z] = robust_minmax_match(continuous_vol[:, :, z], ref_resized)
+        continuous_vol = clip01(continuous_vol)
+
+        # Model 3: Realistic geological approach
+        print("🔹 Model 3: Realistic geological approach...")
+        shale_assembler = RealisticShaleAssembler(
+            vol_size=128,
+            patch_size=64,
+            mineral_composition=target_composition
+        )
+        realistic_vol = shale_assembler.create_realistic_shale_volume(sem_reference)
+
+        # Model 4: NEW Complete Continuous 3D Shale Model
+        print("🔹 Model 4: Complete Continuous 3D Shale Model...")
+        enhanced_continuous_assembler = EnhancedContinuousAssembler(vol_size=128, patch_size=64)
+        complete_continuous_vol = self._create_enhanced_continuous_volume(sem_reference, target_composition)
+
+        # Match intensity statistics for complete continuous model
+        if sem_reference is not None:
+            if sem_reference.ndim == 3:
+                sem_ref_2d = np.mean(sem_reference, axis=2)
+            else:
+                sem_ref_2d = sem_reference
+            ref_resized = cv2.resize(sem_ref_2d, (complete_continuous_vol.shape[1], complete_continuous_vol.shape[0]), interpolation=cv2.INTER_AREA)
+            for z in range(complete_continuous_vol.shape[2]):
+                complete_continuous_vol[:, :, z] = robust_minmax_match(complete_continuous_vol[:, :, z], ref_resized)
+        complete_continuous_vol = clip01(complete_continuous_vol)
+
+        print("✅ Generated 4 different 3D models for comparison")
+        # Step 6: Match slice stats to reference SEM (mineral map or BSE)
+        print("📐 Step 6: Matching intensity statistics to SEM...")
+        ref_img = sem_data['bse'] if sem_data['bse'] is not None else sem_data['mineral_map']
+        if ref_img is not None:
+            ref = ref_img.astype(np.float32)
+            if ref.max() > 2.0:
+                ref = ref / ref.max()
+            if ref.ndim == 3:
+                ref = np.mean(ref, axis=2)  # Convert to grayscale if RGB
+            ref_resized = cv2.resize(ref, (scattered_vol.shape[1], scattered_vol.shape[0]), interpolation=cv2.INTER_AREA)
+            for z in range(scattered_vol.shape[2]):
+                scattered_vol[:, :, z] = robust_minmax_match(scattered_vol[:, :, z], ref_resized)
+        scattered_vol = clip01(scattered_vol)
+        # Step 7: 3D refinement for ALL models
+        print("🧽 Step 7: Applying 3D refinement to all models...")
+        cont = VolumeContinuityEnforcer(smooth_sigma=1.0)
+
+        # Refine scattered model
+        try:
+            refiner = build_refiner3d(input_shape=(128,128,128,1))
+            refiner.fit(scattered_vol[None,...,None], scattered_vol[None,...,None], epochs=1, batch_size=1, verbose=0)
+            scattered_refined = refiner.predict(scattered_vol[None,...,None], verbose=0)[0,...,0]
+        except Exception as e:
+            print(f"⚠️  Scattered refiner skipped: {e}")
+            scattered_refined = scattered_vol.copy()
+
+        scattered_refined = cont.anisotropic_diffusion_3d(scattered_refined, iters=8, kappa=35.0, gamma=0.15)
+        scattered_refined = self.enhance_3d_continuity(scattered_refined)
+        scattered_refined = cont.sharpen_boundaries(scattered_refined, alpha=0.3)
+
+        # Refine continuous model
+        try:
+            refiner_continuous = build_refiner3d(input_shape=(128,128,128,1))
+            refiner_continuous.fit(continuous_vol[None,...,None], continuous_vol[None,...,None], epochs=1, batch_size=1, verbose=0)
+            continuous_refined = refiner_continuous.predict(continuous_vol[None,...,None], verbose=0)[0,...,0]
+        except Exception as e:
+            print(f"⚠️  Continuous refiner skipped: {e}")
+            continuous_refined = continuous_vol.copy()
+
+        continuous_refined = cont.anisotropic_diffusion_3d(continuous_refined, iters=10, kappa=25.0, gamma=0.1)
+        continuous_refined = self.enhance_3d_continuity(continuous_refined)
+        continuous_refined = cont.sharpen_boundaries(continuous_refined, alpha=0.2)
+
+        # Refine realistic model
+        realistic_refined = cont.anisotropic_diffusion_3d(realistic_vol, iters=4, kappa=50.0, gamma=0.05)
+        realistic_refined = cont.sharpen_boundaries(realistic_refined, alpha=0.1)
+
+        # Refine complete continuous model (light refinement to preserve continuity)
+        complete_continuous_refined = cont.anisotropic_diffusion_3d(complete_continuous_vol, iters=6, kappa=60.0, gamma=0.03)
+        complete_continuous_refined = cont.sharpen_boundaries(complete_continuous_refined, alpha=0.05)
+
+        print("✅ All models refined")
+        # Step 7b: Process continuous 3D model
+        print("🧽 Step 7b: 3D refinement for continuous model...")
+        try:
+            refiner_continuous = build_refiner3d(input_shape=(128,128,128,1))
+            refiner_continuous.fit(continuous_vol[None,...,None], continuous_vol[None,...,None], epochs=1, batch_size=1, verbose=0)
+            intensity_continuous_refined = refiner_continuous.predict(continuous_vol[None,...,None], verbose=0)[0,...,0]
+        except Exception as e:
+            print(f"⚠️  Continuous refiner skipped due to: {e}")
+            intensity_continuous_refined = continuous_vol.copy() if 'continuous_vol' in locals() else continuous_assembler.assemble_continuous(banks)
+
+        intensity_continuous_refined = cont.anisotropic_diffusion_3d(intensity_continuous_refined, iters=10, kappa=25.0, gamma=0.1)
+        intensity_continuous_refined = self.enhance_3d_continuity(intensity_continuous_refined)
+        intensity_continuous_refined = cont.sharpen_boundaries(intensity_continuous_refined, alpha=0.2)
+
+        # Step 7c: Enhanced quality for continuous model
+        print("🎨 Step 7c: Enhancing natural appearance for continuous model...")
+        intensity_continuous_refined = self.enhance_3d_model_quality(intensity_continuous_refined)
+
+        # Step 8: Labeling + composition prior for ALL models
+        print("🏷️ Step 8: Applying composition-aware labeling to all models...")
+        assigner = LabelAssigner(target_composition)
+
+        # Label scattered model
+        labels_scattered = assigner.assign(scattered_refined)
+        labels_scattered = cont.prune_small_components(labels_scattered)
+        labels_scattered = cont.smooth_labels_3d(labels_scattered, radius=1)
+        labels_scattered = assigner.soft_rebalance(labels_scattered)
+        achieved_comp_scattered = CompositionTools.composition_from_labels(labels_scattered)
+        score_scattered = CompositionTools.similarity_score(achieved_comp_scattered, target_composition)
+
+        # Label continuous model
+        labels_continuous = assigner.assign(continuous_refined)
+        labels_continuous = cont.prune_small_components(labels_continuous)
+        labels_continuous = cont.smooth_labels_3d(labels_continuous, radius=2)
+        labels_continuous = assigner.soft_rebalance(labels_continuous)
+        achieved_comp_continuous = CompositionTools.composition_from_labels(labels_continuous)
+        score_continuous = CompositionTools.similarity_score(achieved_comp_continuous, target_composition)
+
+        # Label realistic model
+        labels_realistic = assigner.assign(realistic_refined)
+        labels_realistic = cont.prune_small_components(labels_realistic)
+        labels_realistic = cont.smooth_labels_3d(labels_realistic, radius=1)
+        labels_realistic = assigner.soft_rebalance(labels_realistic)
+        achieved_comp_realistic = CompositionTools.composition_from_labels(labels_realistic)
+        score_realistic = CompositionTools.similarity_score(achieved_comp_realistic, target_composition)
+
+        # Label complete continuous model
+        labels_complete_continuous = assigner.assign(complete_continuous_refined)
+        labels_complete_continuous = cont.prune_small_components(labels_complete_continuous)
+        labels_complete_continuous = cont.smooth_labels_3d(labels_complete_continuous, radius=1)
+        labels_complete_continuous = assigner.soft_rebalance(labels_complete_continuous)
+        achieved_comp_complete_continuous = CompositionTools.composition_from_labels(labels_complete_continuous)
+        score_complete_continuous = CompositionTools.similarity_score(achieved_comp_complete_continuous, target_composition)
+
+        print(f"📊 Composition similarity scores:")
+        print(f"   • Scattered model: {score_scattered:.4f}")
+        print(f"   • Continuous model: {score_continuous:.4f}")
+        print(f"   • Realistic model: {score_realistic:.4f}")
+        print(f"   • Complete Continuous model: {score_complete_continuous:.4f}")
+
+        # Step 8b: Labeling for continuous model
+        print("🏷️ Step 8b: Labeling continuous model with composition prior...")
+        labels_continuous = assigner.assign(intensity_continuous_refined)
+        labels_continuous = cont.prune_small_components(labels_continuous)
+        labels_continuous = cont.smooth_labels_3d(labels_continuous, radius=2)  # Stronger smoothing for continuous
+        labels_continuous = assigner.soft_rebalance(labels_continuous)
+        achieved_comp_continuous = CompositionTools.composition_from_labels(labels_continuous)
+        score_continuous = CompositionTools.similarity_score(achieved_comp_continuous, target_composition)
+        print(f"📊 Composition similarity (continuous model vs target): {score_continuous:.4f}")
+
+        # Step 9: Enhanced visualizations & QC for ALL models
+        print("📊 Step 9: Creating comprehensive visualizations for all models...")
+        palette = MineralPalette(self.base_path)
+        palette.try_extract_from_folder(sample_name)
+        color_tools = ColorAndExportTools(self.base_path, palette)
+
+        # Save colored slices for all models
+        color_tools.save_colored_center_slices(labels_scattered, sample_name + "_scattered")
+        color_tools.save_colored_center_slices(labels_continuous, sample_name + "_continuous")
+        color_tools.save_colored_center_slices(labels_realistic, sample_name + "_realistic")
+        color_tools.save_colored_center_slices(labels_complete_continuous, sample_name + "_complete_continuous")
+
+        # Save TIFF stacks for all models
+        color_tools.save_tiff_stack_labels(labels_scattered, sample_name + "_scattered")
+        color_tools.save_tiff_stack_labels(labels_continuous, sample_name + "_continuous")
+        color_tools.save_tiff_stack_labels(labels_realistic, sample_name + "_realistic")
+        color_tools.save_tiff_stack_labels(labels_complete_continuous, sample_name + "_complete_continuous")
+
+        # Create comprehensive visualizations for all models
+        self.visualizer.create_3d_volume_visualization(scattered_refined, sample_name + "_scattered")
+        self.visualizer.create_3d_volume_visualization(continuous_refined, sample_name + "_continuous")
+        self.visualizer.create_realistic_shale_visualization(realistic_refined, sample_name + "_realistic")
+        self.visualizer.create_realistic_shale_visualization(complete_continuous_refined, sample_name + "_complete_continuous")
+
+        # Create slice comparisons for all models
+        self.visualizer.create_slice_comparison(patches[:4, :, :, 0], scattered_refined, sample_name + "_scattered")
+        self.visualizer.create_slice_comparison(patches[:4, :, :, 0], continuous_refined, sample_name + "_continuous")
+        self.visualizer.create_slice_comparison(patches[:4, :, :, 0], realistic_refined, sample_name + "_realistic")
+        self.visualizer.create_slice_comparison(patches[:4, :, :, 0], complete_continuous_refined, sample_name + "_complete_continuous")
+
+        # Create enhanced model comparison visualization
+        self.visualizer.create_enhanced_model_comparison_visualization(
+            scattered_refined, continuous_refined, realistic_refined, complete_continuous_refined,
+            sample_name, target_composition,
+            achieved_comp_scattered, achieved_comp_continuous,
+            achieved_comp_realistic, achieved_comp_complete_continuous
+        )
+
+        extra_viz = ExtraVisualizer(self.base_path)
+        extra_viz.orthogrid(scattered_refined, sample_name + "_scattered", n=8)
+        extra_viz.orthogrid(continuous_refined, sample_name + "_continuous", n=8)
+        extra_viz.orthogrid(realistic_refined, sample_name + "_realistic", n=8)
+        extra_viz.orthogrid(complete_continuous_refined, sample_name + "_complete_continuous", n=8)
+
+        similarity_score_scattered = self.visualizer.create_composition_analysis(target_composition, achieved_comp_scattered, sample_name + "_scattered")
+        similarity_score_continuous = self.visualizer.create_composition_analysis(target_composition, achieved_comp_continuous, sample_name + "_continuous")
+        similarity_score_realistic = self.visualizer.create_composition_analysis(target_composition, achieved_comp_realistic, sample_name + "_realistic")
+        similarity_score_complete_continuous = self.visualizer.create_composition_analysis(target_composition, achieved_comp_complete_continuous, sample_name + "_complete_continuous")
+
+        extra_viz.composition_radar(target_composition, achieved_comp_scattered, sample_name + "_scattered")
+        extra_viz.composition_radar(target_composition, achieved_comp_continuous, sample_name + "_continuous")
+        extra_viz.composition_radar(target_composition, achieved_comp_realistic, sample_name + "_realistic")
+        extra_viz.composition_radar(target_composition, achieved_comp_complete_continuous, sample_name + "_complete_continuous")
+
+        # Step 10: Export to Abaqus
+        print("💾 Step 10: Export to Abaqus...")
+        abaqus_dir = os.path.join(self.base_path, 'Output/Abaqus')
+        # Export realistic model to Abaqus (most geologically accurate)
+        inp_path, prop_path = self.abaqus_exporter.export_to_abaqus(realistic_refined, sample_name, abaqus_dir)
+        print("💾 Step 10b: Exporting CAE-compatible small file...")
+        cae_path = self.abaqus_exporter.export_abaqus_cae_compatible(realistic_refined, sample_name)
+        # Step 11: Save results
+        print("💾 Step 11: Save final results...")
+        self.save_final_results(realistic_refined, sample_name, score_realistic, score_realistic,
+                        target_composition, achieved_comp_realistic)
+        print("📊 Step 12: Calculating equivalent modulus and comprehensive analysis...")
+        youngs_modulus_dict = {
+            'Silicates': 89.6, 'Carbonate': 74.6, 'Clay': 22.3,
+            'Kerogen': 9.2, 'Others': 12.392
+        }
+
+        # Calculate equivalent modulus using realistic model
+        equivalent_modulus = calculate_equivalent_modulus_fem(realistic_refined, youngs_modulus_dict)
+
+        # Calculate comprehensive statistics for realistic model
+        volume_stats = calculate_volume_statistics(realistic_refined)
+        spatial_corr = calculate_spatial_correlation(realistic_refined)
+        connectivity = calculate_phase_connectivity(realistic_refined)
+
+        print(f"✅ Equivalent modulus: {equivalent_modulus:.2f} GPa")
+        print(f"📈 Volume statistics: Mean={volume_stats['mean_intensity']:.3f}, "
+              f"Std={volume_stats['std_intensity']:.3f}, Porosity={volume_stats['porosity_05']:.1%}")
+        print(f"🔗 Spatial correlation: X={spatial_corr['correlation_x']:.3f}, "
+              f"Y={spatial_corr['correlation_y']:.3f}, Z={spatial_corr['correlation_z']:.3f}")
+
+        end_time = pd.Timestamp.now()
+        processing_time = (end_time - start_time).total_seconds() / 60.0
+        print(f"\n🎉 PROCESSING COMPLETED FOR {sample_name}")
+        print("=" * 70)
+        print(f"⏱️  Total time: {processing_time:.1f} minutes")
+        print(f"📊 Composition similarity: {score_realistic:.4f}")
+        print(f"🎯 Scattered volume dimensions: {scattered_refined.shape}")
+        print(f"🎯 Continuous volume dimensions: {continuous_refined.shape}")
+        print(f"🎯 Realistic volume dimensions: {realistic_refined.shape}")
+        print(f"💾 Abaqus INP: {inp_path}")
+        print(f"🔧 Material props: {prop_path}")
+        print(f"📈 Visualizations saved in Output/ folder")
+
+        return {
+            'scattered_volume': scattered_refined,
+            'continuous_volume': continuous_refined,
+            'realistic_volume': realistic_refined,
+            'complete_continuous_volume': complete_continuous_refined,
+            'scattered_labels': labels_scattered,
+            'continuous_labels': labels_continuous,
+            'realistic_labels': labels_realistic,
+            'complete_continuous_labels': labels_complete_continuous,
+            'scattered_similarity': score_scattered,
+            'continuous_similarity': score_continuous,
+            'realistic_similarity': score_realistic,
+            'complete_continuous_similarity': score_complete_continuous,
+            'processing_time': processing_time,
+            'abaqus_files': [inp_path, prop_path],
+            'composition': {
+                'target': target_composition,
+                'scattered_achieved': achieved_comp_scattered,
+                'continuous_achieved': achieved_comp_continuous,
+                'realistic_achieved': achieved_comp_realistic,
+                'complete_continuous_achieved': achieved_comp_complete_continuous
+            }
+        }
+
+    # ---- Kept from your original (helper generators) ----
+    def create_realistic_sem_image(self, size=(1024, 1024)):
+        print("🎨 Creating realistic SEM image...")
+        h, w = size
+        base = np.random.rand(h, w).astype(np.float32) * 0.3
+        for _ in range(20):
+            x, y = np.random.randint(0, w), np.random.randint(0, h)
+            length = np.random.randint(200, 500)
+            width = np.random.randint(15, 50)
+            angle = np.random.uniform(0, 2*np.pi)
+            for i in range(length):
+                for j in range(-width//2, width//2):
+                    xi = int(x + i * np.cos(angle) + j * np.sin(angle))
+                    yi = int(y + i * np.sin(angle) - j * np.cos(angle))
+                    if 0 <= xi < w and 0 <= yi < h:
+                        dist_factor = 1.0 - abs(j) / (width/2)
+                        intensity = 0.8 + 0.2 * dist_factor
+                        base[yi, xi] = max(base[yi, xi], intensity)
+        clay_mask = np.random.rand(h, w) > 0.7
+        base[clay_mask] = np.maximum(base[clay_mask], 0.5)
+        for _ in range(100):
+            x, y = np.random.randint(0, w), np.random.randint(0, h)
+            radius = np.random.randint(3, 15)
+            y_coords, x_coords = np.ogrid[-y:h-y, -x:w-x]
+            mask = x_coords*x_coords + y_coords*y_coords <= radius*radius
+            base[mask] = np.minimum(base[mask], 0.3)
+        base = cv2.GaussianBlur(base, (7, 7), 2.0)
+        base = (base - base.min()) / (base.max() - base.min())
+        print("✅ Realistic SEM image created")
+        return base
+    def create_model_comparison_visualization(self, scattered_vol, continuous_vol, realistic_vol,
+                                            sample_name, target_comp,
+                                            comp_scattered, comp_continuous, comp_realistic):
+        """Create comprehensive comparison of all three models"""
+        self.visualizer.create_model_comparison_visualization(
+            scattered_vol, continuous_vol, realistic_vol,
+            sample_name, target_comp,
+            comp_scattered, comp_continuous, comp_realistic
+        )
+    def save_final_results(self, volume, sample_name, comp_score, similarity_score, target_comp, volume_comp):
+        print("💾 Saving final results with comprehensive analysis...")
+        self.save_training_patches_properly(self.patches, sample_name)
+        self.save_quality_metrics(volume, sample_name, comp_score, target_comp, volume_comp)
+        # Calculate equivalent modulus and comprehensive metrics
+        youngs_modulus_dict = {
+            'Silicates': 89.6, 'Carbonate': 74.6, 'Clay': 22.3,
+            'Kerogen': 9.2, 'Others': 12.392
+        }
+
+        equivalent_modulus = calculate_equivalent_modulus_fem(volume, youngs_modulus_dict)
+        volume_stats = calculate_volume_statistics(volume)
+        spatial_corr = calculate_spatial_correlation(volume)
+        connectivity = calculate_phase_connectivity(volume)
+
+        volume_path = os.path.join(self.base_path, 'Output/3D_Models', f'{sample_name}_3d_volume.npz')
+        np.savez_compressed(volume_path, volume=volume, composition=volume_comp)
+
+        metadata = {
+            'sample_name': sample_name,
+            'volume_shape': list(volume.shape),
+            'composition_similarity': comp_score,
+            'equivalent_modulus_gpa': equivalent_modulus,
+            'volume_statistics': volume_stats,
+            'spatial_correlation': spatial_corr,
+            'phase_connectivity': connectivity,
+            'target_composition': target_comp,
+            'achieved_composition': volume_comp,
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'methodology': 'SliceGAN+ResNet18+FEM+ComprehensiveAnalysis',
+            'reference': 'A Data-Driven Approach to Generating Stochastic Mesoscale 3D Shale Volume Elements From 2D SEM Images'
+        }
+
+        metadata_path = os.path.join(self.base_path, 'Output/3D_Models', f'{sample_name}_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2, cls=NumpyEncoder)
+
+        # FIX: Save training patches properly
+        try:
+            training_dir = os.path.join(self.base_path, 'Output/Training_Data', sample_name)
+            safe_makedirs(training_dir)
+
+            # Get patches from the current process
+            sem_data = self.sem_processor.load_sample_images(sample_name)
+            if sem_data['mineral_map'] is not None:
+                patches, _ = self.create_10x10_patches(sem_data['mineral_map'])
+
+                # Save first 16 patches
+                for i in range(min(16, len(patches))):
+                    patch = patches[i].squeeze()
+                    if patch.ndim == 2:  # Grayscale
+                        patch_img = (patch * 255).astype(np.uint8)
+                        cv2.imwrite(os.path.join(training_dir, f'patch_{i:02d}.png'), patch_img)
+                    else:  # Multi-channel
+                        patch_img = (patch * 255).astype(np.uint8)
+                        if patch_img.shape[-1] == 1:
+                            patch_img = patch_img.squeeze()
+                        cv2.imwrite(os.path.join(training_dir, f'patch_{i:02d}.png'), patch_img)
+
+            print(f"✅ Training data saved: {training_dir}")
+        except Exception as e:
+            print(f"⚠️  Could not save training data: {e}")
+
+        print(f"✅ Results saved:\n   - 3D volume: {volume_path}\n   - Metadata: {metadata_path}")
+        print(f"📊 Equivalent modulus: {equivalent_modulus:.2f} GPa")
+        print(f"📈 Volume porosity: {volume_stats['porosity_05']:.1%}")
+        print(f"🔗 Spatial anisotropy: {spatial_corr['anisotropy_index']:.3f}")
+
+    def create_10x10_patches(self, image, patch_size=64):
+        """Create exactly 100 patches (10x10 grid) from 1024x1024 image"""
+        if image is None:
+            return None, None
+
+        h, w = image.shape[:2]
+        if h != 1024 or w != 1024:
+            image = cv2.resize(image, (1024, 1024), interpolation=cv2.INTER_AREA)
+
+        patches = []
+        positions = []
+
+        # Calculate stride for exactly 10 patches in each dimension
+        stride_h = (h - patch_size) // 9
+        stride_w = (w - patch_size) // 9
+
+        for i in range(10):
+            for j in range(10):
+                y = i * stride_h
+                x = j * stride_w
+                patch = image[y:y+patch_size, x:x+patch_size]
+                patches.append(patch)
+                positions.append((y, x))
+
+        patches = np.array(patches)
+        if patches.ndim == 3:
+            patches = patches[..., None]  # Add channel dimension
+
+        print(f"✅ Created exactly {len(patches)} patches (10x10 grid)")
+        return patches, positions
+    def _create_enhanced_continuous_volume(self, sem_reference, target_composition):
+        """Create enhanced continuous volume as fallback"""
+        V = 128
+        volume = np.zeros((V, V, V), dtype=np.float32)
+
+        # Create base pattern with perfect continuity
+        z_profile = np.linspace(0.8, 1.2, V)
+        for z in range(V):
+            # Base pattern with strong horizontal correlation
+            if z == 0:
+                base_slice = np.random.rand(V, V) * 0.5 + 0.3
+            else:
+                # Very strong correlation with previous slice
+                base_slice = 0.95 * volume[:, :, z-1] + 0.05 * np.random.rand(V, V)
+
+            # Apply SEM reference if available
+            if sem_reference is not None:
+                if sem_reference.ndim == 3:
+                    sem_ref = np.mean(sem_reference, axis=2)
+                else:
+                    sem_ref = sem_reference
+                sem_resized = cv2.resize(sem_ref, (V, V))
+                base_slice = 0.7 * base_slice + 0.3 * sem_resized
+
+            volume[:, :, z] = base_slice * z_profile[z]
+
+        # Apply composition-based intensity mapping
+        total = sum(target_composition.values())
+        cumulative = 0
+        thresholds = []
+
+        phases = ['Silicates', 'Carbonate', 'Clay', 'Kerogen', 'Others']
+        for phase in phases:
+            cumulative += target_composition.get(phase, 0) / total
+            thresholds.append(cumulative)
+
+        # Apply thresholds
+        volume_flat = volume.ravel()
+        sorted_idx = np.argsort(volume_flat)
+
+        current_idx = 0
+        for i, threshold in enumerate(thresholds):
+            phase_count = int(len(volume_flat) * threshold)
+            end_idx = min(current_idx + phase_count, len(volume_flat))
+
+            phase_intensity = 0.1 + 0.8 * (i / len(thresholds))
+            volume_flat[sorted_idx[current_idx:end_idx]] = phase_intensity
+            current_idx = end_idx
+
+        volume = volume_flat.reshape(volume.shape)
+
+        # Final smoothing for perfect continuity
+        volume = ndimage.gaussian_filter(volume, sigma=(1.5, 1.5, 1.0))
+
+        return clip01(volume)
+    def enhance_3d_continuity(self, volume):
+        """Enhanced 3D continuity with proper structure preservation for Abaqus"""
+        print("🔄 Enhancing 3D continuity for better quality...")
+
+        # Step 1: Stronger 3D Gaussian smoothing to improve continuity
+        vol_smooth = ndimage.gaussian_filter(volume, sigma=(1.5, 1.5, 1.0))
+
+        # Step 2: Apply anisotropic diffusion for edge preservation
+        for z in range(volume.shape[2]):
+            slice_2d = volume[:, :, z]
+
+            # Use bilateral filter for better edge preservation
+            slice_uint8 = (slice_2d * 255).astype(np.uint8)
+            slice_bilateral = cv2.bilateralFilter(slice_uint8, d=9, sigmaColor=75, sigmaSpace=75)
+            vol_smooth[:, :, z] = slice_bilateral.astype(np.float32) / 255.0
+
+        # Step 3: Enhance contrast significantly
+        for z in range(volume.shape[2]):
+            slice_2d = vol_smooth[:, :, z]
+            slice_uint8 = (slice_2d * 255).astype(np.uint8)
+
+            # Apply strong CLAHE for better contrast
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            slice_enhanced = clahe.apply(slice_uint8)
+            vol_smooth[:, :, z] = slice_enhanced.astype(np.float32) / 255.0
+
+        # Step 4: More aggressive blending to preserve original texture
+        local_std = ndimage.generic_filter(volume, np.std, size=5)
+        blend_weights = np.clip(local_std * 15, 0.4, 0.8)  # Preserve more original texture
+
+        result = blend_weights * volume + (1 - blend_weights) * vol_smooth
+
+        # Step 5: Final coherence with stronger smoothing
+        result = ndimage.gaussian_filter(result, sigma=(0.8, 0.8, 0.5))
+
+        return clip01(result)
+    def save_training_patches_properly(self, patches, sample_name):
+        """Properly save training patches to Training_Data folder"""
+        try:
+            training_dir = os.path.join(self.base_path, 'Output/Training_Data', sample_name)
+            os.makedirs(training_dir, exist_ok=True)
+
+            if patches is None or len(patches) == 0:
+                print("⚠️  No patches to save")
+                return
+
+            # Save first 20 patches as PNG
+            saved_count = 0
+            for i in range(min(20, len(patches))):
+                patch = patches[i]
+
+                # Handle different patch dimensions - FIXED
+                if patch.ndim == 4:  # (batch, height, width, channels)
+                    patch = patch[0] if patch.shape[0] > 0 else patch.squeeze()
+
+                # Ensure we have a 2D image
+                if patch.ndim == 3:
+                    if patch.shape[-1] == 1:  # Single channel
+                        patch = patch.squeeze()
+                    elif patch.shape[-1] == 3:  # RGB, convert to grayscale for saving
+                        patch = np.mean(patch, axis=-1)
+                    else:
+                        patch = patch[:, :, 0]  # Take first channel
+
+                # Normalize to 0-255 range
+                if patch.dtype != np.uint8:
+                    patch_normalized = (patch - np.min(patch)) / (np.max(patch) - np.min(patch) + 1e-8)
+                    patch_uint8 = (patch_normalized * 255).astype(np.uint8)
+                else:
+                    patch_uint8 = patch
+
+                # Ensure 2D for saving
+                if patch_uint8.ndim != 2:
+                    patch_uint8 = patch_uint8.squeeze()
+
+                if patch_uint8.ndim != 2:
+                    print(f"⚠️  Patch {i} has wrong dimensions: {patch_uint8.shape}, skipping")
+                    continue
+
+                # Save as PNG
+                patch_path = os.path.join(training_dir, f'patch_{i:03d}.png')
+
+                # Use PIL for more reliable saving
+                try:
+                    from PIL import Image
+                    img = Image.fromarray(patch_uint8)
+                    img.save(patch_path)
+                    saved_count += 1
+                except Exception as e:
+                    # Fallback to OpenCV
+                    success = cv2.imwrite(patch_path, patch_uint8)
+                    if success:
+                        saved_count += 1
+                    else:
+                        print(f"⚠️  Failed to save patch {i} with shape {patch_uint8.shape} and dtype {patch_uint8.dtype}")
+
+            print(f"✅ Saved {saved_count}/{min(20, len(patches))} training patches to {training_dir}")
+
+        except Exception as e:
+            print(f"❌ Error saving training patches: {e}")
+            import traceback
+            traceback.print_exc()
+    def save_quality_metrics(self, volume, sample_name, composition_similarity, target_comp, achieved_comp):
+        """Save comprehensive quality metrics to Quality_Metrics folder"""
+        try:
+            metrics_dir = os.path.join(self.base_path, 'Output/Quality_Metrics', sample_name)
+            os.makedirs(metrics_dir, exist_ok=True)
+
+            # Calculate comprehensive metrics
+            youngs_modulus_dict = {
+                'Silicates': 89.6, 'Carbonate': 74.6, 'Clay': 22.3,
+                'Kerogen': 9.2, 'Others': 12.392
+            }
+
+            equivalent_modulus = calculate_equivalent_modulus_fem(volume, youngs_modulus_dict)
+            volume_stats = calculate_volume_statistics(volume)
+            spatial_corr = calculate_spatial_correlation(volume)
+            connectivity = calculate_phase_connectivity(volume)
+            moran_i = morans_I(volume)
+
+            # Create metrics dictionary
+            metrics = {
+                'sample_name': sample_name,
+                'composition_similarity': float(composition_similarity),
+                'equivalent_modulus_gpa': float(equivalent_modulus),
+                'spatial_autocorrelation': float(moran_i),
+                'volume_statistics': volume_stats,
+                'spatial_correlation': spatial_corr,
+                'phase_connectivity': connectivity,
+                'target_composition': target_comp,
+                'achieved_composition': achieved_comp,
+                'volume_dimensions': list(volume.shape),
+                'timestamp': pd.Timestamp.now().isoformat()
+            }
+
+            # Save as JSON
+            metrics_path = os.path.join(metrics_dir, f'{sample_name}_quality_metrics.json')
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=2, cls=NumpyEncoder)
+
+            # Save as CSV for easy reading
+            csv_metrics = {
+                'Metric': [
+                    'Composition Similarity', 'Equivalent Modulus (GPa)',
+                    'Spatial Autocorrelation (Moran\'s I)', 'Mean Intensity',
+                    'Std Intensity', 'Porosity (<0.5)', 'X-Correlation',
+                    'Y-Correlation', 'Z-Correlation', 'Anisotropy Index'
+                ],
+                'Value': [
+                    f"{composition_similarity:.4f}",
+                    f"{equivalent_modulus:.2f}",
+                    f"{moran_i:.4f}",
+                    f"{volume_stats['mean_intensity']:.4f}",
+                    f"{volume_stats['std_intensity']:.4f}",
+                    f"{volume_stats['porosity_05']:.4f}",
+                    f"{spatial_corr['correlation_x']:.4f}",
+                    f"{spatial_corr['correlation_y']:.4f}",
+                    f"{spatial_corr['correlation_z']:.4f}",
+                    f"{spatial_corr['anisotropy_index']:.4f}"
+                ]
+            }
+
+            csv_path = os.path.join(metrics_dir, f'{sample_name}_quality_summary.csv')
+            pd.DataFrame(csv_metrics).to_csv(csv_path, index=False)
+
+            # Create a visual metrics plot
+            self.create_metrics_visualization(metrics, sample_name, metrics_dir)
+
+            print(f"✅ Quality metrics saved to: {metrics_dir}")
+
+        except Exception as e:
+            print(f"❌ Error saving quality metrics: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def create_metrics_visualization(self, metrics, sample_name, save_dir):
+        """Create visual representation of quality metrics"""
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+            fig.suptitle(f'Quality Metrics - {sample_name}', fontsize=16, fontweight='bold')
+
+            # Composition comparison
+            phases = list(metrics['target_composition'].keys())
+            target_vals = [metrics['target_composition'][p] for p in phases]
+            achieved_vals = [metrics['achieved_composition'].get(p, 0) for p in phases]
+
+            x = np.arange(len(phases))
+            width = 0.35
+            axes[0,0].bar(x - width/2, target_vals, width, label='Target', alpha=0.7, color='blue')
+            axes[0,0].bar(x + width/2, achieved_vals, width, label='Achieved', alpha=0.7, color='red')
+            axes[0,0].set_xlabel('Mineral Phases')
+            axes[0,0].set_ylabel('Volume Percentage (%)')
+            axes[0,0].set_title('Composition Matching')
+            axes[0,0].set_xticks(x)
+            axes[0,0].set_xticklabels(phases, rotation=45)
+            axes[0,0].legend()
+            axes[0,0].grid(True, alpha=0.3)
+
+            # Spatial metrics
+            spatial_metrics = ['X-Correlation', 'Y-Correlation', 'Z-Correlation', 'Anisotropy']
+            spatial_values = [
+                metrics['spatial_correlation']['correlation_x'],
+                metrics['spatial_correlation']['correlation_y'],
+                metrics['spatial_correlation']['correlation_z'],
+                metrics['spatial_correlation']['anisotropy_index']
+            ]
+            axes[0,1].bar(spatial_metrics, spatial_values, color='green', alpha=0.7)
+            axes[0,1].set_title('Spatial Correlation Metrics')
+            axes[0,1].set_ylabel('Correlation Coefficient')
+            axes[0,1].grid(True, alpha=0.3)
+
+            # Volume statistics
+            vol_metrics = ['Mean', 'Std Dev', 'Porosity']
+            vol_values = [
+                metrics['volume_statistics']['mean_intensity'],
+                metrics['volume_statistics']['std_intensity'],
+                metrics['volume_statistics']['porosity_05']
+            ]
+            axes[1,0].bar(vol_metrics, vol_values, color='orange', alpha=0.7)
+            axes[1,0].set_title('Volume Statistics')
+            axes[1,0].set_ylabel('Value')
+            axes[1,0].grid(True, alpha=0.3)
+
+            # Key metrics summary
+            key_metrics = ['Comp Similarity', 'Modulus (GPa)', 'Moran\'s I']
+            key_values = [
+                metrics['composition_similarity'],
+                metrics['equivalent_modulus_gpa'],
+                metrics['spatial_autocorrelation']
+            ]
+            axes[1,1].bar(key_metrics, key_values, color='purple', alpha=0.7)
+            axes[1,1].set_title('Key Quality Indicators')
+            axes[1,1].set_ylabel('Value')
+            axes[1,1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plot_path = os.path.join(save_dir, f'{sample_name}_metrics_visualization.png')
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+        except Exception as e:
+            print(f"⚠️  Could not create metrics visualization: {e}")
+    def enhance_3d_model_quality(self, volume):
+        """Enhanced 3D model quality for realistic shale appearance with colorful plates"""
+        print("🎨 Enhancing 3D model quality for realistic shale appearance...")
+
+        # Step 1: Create layered structure (like real shale)
+        layered_volume = volume.copy()
+        H, W, D = volume.shape
+
+        # Add horizontal layering (shale bedding)
+        for z in range(D):
+            layer_intensity = 0.3 + 0.4 * np.sin(z * 0.1)  # Sinusoidal layering
+            layered_volume[:, :, z] = layered_volume[:, :, z] * (0.7 + 0.3 * layer_intensity)
+
+        # Step 2: Add vertical fractures and cracks
+        fracture_mask = np.zeros_like(volume, dtype=bool)
+        for _ in range(5):  # Add 5 major fracture systems
+            fracture_width = np.random.randint(2, 8)
+            fracture_length = np.random.randint(20, 60)
+            x_start = np.random.randint(0, W - fracture_length)
+            y_start = np.random.randint(0, H - fracture_width)
+            z_start = np.random.randint(0, D)
+
+            for i in range(fracture_length):
+                for j in range(fracture_width):
+                    x = min(x_start + i, W-1)
+                    y = min(y_start + j, H-1)
+                    # Create fracture that extends through depth
+                    for z in range(D):
+                        if np.random.random() > 0.3:  # 70% chance of fracture at each depth
+                            layered_volume[y, x, z] *= 0.3  # Darken fracture areas
+
+        # Step 3: Add mineral vein patterns
+        for _ in range(8):  # Add mineral veins
+            vein_thickness = np.random.randint(3, 10)
+            vein_length = np.random.randint(30, 80)
+            angle = np.random.uniform(0, 2*np.pi)
+
+            center_x, center_y = np.random.randint(0, W), np.random.randint(0, H)
+
+            for i in range(vein_length):
+                for j in range(-vein_thickness//2, vein_thickness//2):
+                    x = int(center_x + i * np.cos(angle) + j * np.sin(angle))
+                    y = int(center_y + i * np.sin(angle) - j * np.cos(angle))
+
+                    if 0 <= x < W and 0 <= y < H:
+                        # Brighten vein areas (mineral deposits)
+                        for z in range(D):
+                            if np.random.random() > 0.5:
+                                layered_volume[y, x, z] = np.clip(layered_volume[y, x, z] + 0.4, 0, 1)
+
+        # Step 4: Multi-scale filtering for natural texture
+        vol_smooth = ndimage.gaussian_filter(layered_volume, sigma=1.0)
+
+        # Step 5: Preserve important geological features
+        gradient = np.gradient(layered_volume)
+        gradient_magnitude = np.sqrt(sum(g**2 for g in gradient))
+        feature_mask = gradient_magnitude > np.percentile(gradient_magnitude, 75)
+
+        # Blend features back
+        result = np.where(feature_mask, layered_volume * 0.6 + vol_smooth * 0.4, vol_smooth)
+
+        # Step 6: Add natural geological noise
+        geological_noise = np.random.normal(0, 0.05, volume.shape).astype(np.float32)
+        result = result + geological_noise
+
+        # Step 7: Ensure proper dynamic range and final smoothing
+        result = np.clip(result, 0, 1)
+        result = ndimage.gaussian_filter(result, sigma=0.5)
+
+        print("✅ 3D shale model enhanced with realistic geological features")
+        return result
+
+# ============== MAIN ==============
+if __name__ == "__main__":
+    set_global_seed(42)  # (ADDED) reproducibility
+
+    base_path = r"C:\Users\红米\Desktop\Files"
+    excel_path = os.path.join(base_path, "Mineral_quant_all_samples.xlsx")
+
+    print("🚀 ADVANCED 3D SHALE VOLUME ELEMENTS GENERATOR")
+    print("=" * 70)
+    print("Methodology based on:")
+    print("'A Data-Driven Approach to Generating Stochastic Mesoscale")
+    print("3D Shale Volume Elements From 2D SEM Images'")
+    print("=" * 70)
+    print("Key Features:")
+    print("• Residual Attention U-Net (Dice+CE)")
+    print("• Multi-scale assembly + 3D refiner")
+    print("• Composition-aware labeling prior")
+    print("• Abaqus-compatible export with material properties")
+    print("• GPU-accelerated training")
+    print("• Enhanced quality with more training epochs")
+    print("=" * 70)
+
+    reconstructor = FastShaleReconstructor3D(base_path, excel_path)
+    target_sample = "sample7"  # sample1..sample8
+    print(f"\n🎯 Target sample: {target_sample}\n" + "="*70)
+
+    # INCREASE EPOCHS FOR BETTER QUALITY
+    result = reconstructor.process_sample(
+        target_sample,
+        unet_epochs=40,  # Increased from 10 to 30
+        slicegan_epochs=50  # Increased from 10 to 20
+    )
+
+    if result:
+        print(f"\n🎉 SUCCESS! 4 different 3D shale volumes generated for {target_sample}")
+        print(f"📊 Scattered volume shape: {result['scattered_volume'].shape}")
+        print(f"📊 Continuous volume shape: {result['continuous_volume'].shape}")
+        print(f"📊 Realistic volume shape: {result['realistic_volume'].shape}")
+        print(f"📊 Complete Continuous volume shape: {result['complete_continuous_volume'].shape}")
+        print(f"📈 Scattered similarity: {result['scattered_similarity']:.4f}")
+        print(f"📈 Continuous similarity: {result['continuous_similarity']:.4f}")
+        print(f"📈 Realistic similarity: {result['realistic_similarity']:.4f}")
+        print(f"📈 Complete Continuous similarity: {result['complete_continuous_similarity']:.4f}")
+        print(f"⏱️  Processing time: {result['processing_time']:.1f} minutes")
+        print(f"💾 Abaqus files: {result['abaqus_files']}")
+        print(f"📁 All results saved in Output/ directory")
+
+        # Check quality metrics for realistic model (primary)
+        volume = result['realistic_volume']
+        intensity_std = np.std(volume)
+        moran_i = morans_I(volume)
+
+        print(f"\n📊 FINAL QUALITY METRICS:")
+        print(f"   • Intensity standard deviation: {intensity_std:.4f}")
+        print(f"   • Moran's I (spatial autocorrelation): {moran_i:.4f}")
+        print(f"   • Realistic model similarity: {result['realistic_similarity']:.4f}")
+
+        if intensity_std > 0.1 and moran_i > 0.1:
+            print("✅ Quality metrics are good!")
+        else:
+            print("⚠️  Consider increasing training epochs further for better quality")
+
